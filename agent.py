@@ -6,8 +6,8 @@ def anything( z:str, y: int = 1 ) -> str:
     return y * z
 
 @entrypoint()
-def in_func( x: int = 1 ):
-    return sn1.tools.out_func(x=x)
+def func( x: int = 1 ):
+    return sn1.tools.func(x=x)
 
 @entrypoint()
 def llm( prompt:str ):

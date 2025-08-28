@@ -22,9 +22,13 @@ load_dotenv(override=True)
 NETUID = 1
 
 # ---------------- Config ----------------
-def get_conf(key, default=None) -> Any:
+def get_conf(key, default=None, except_input: bool = False) -> Any:
     v = os.getenv(key)
     if not v and default is None:
+        if except_input:
+            v = input(f"Enter value for {key}: ")
+            os.environ[key] = v
+            return v
         raise ValueError(f"{key} not set.\nYou must set env var: {key} in .env")
     return v or default
 
@@ -35,15 +39,16 @@ def _trace(self, msg, *args, **kwargs):
     if self.isEnabledFor(TRACE):
         self._log(TRACE, msg, args, **kwargs)
 logging.Logger.trace = _trace
-logger = logging.getLogger("affine")
+logger = logging.getLogger("sn1")
 def setup_logging(verbosity: int):
     level = TRACE if verbosity >= 3 else logging.DEBUG if verbosity == 2 else logging.INFO if verbosity == 1 else logging.CRITICAL + 1
     for noisy in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions", "botocore", "uvicorn.access"]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    logging.basicConfig(level=level, format="[%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 def info(): setup_logging(1)
 def debug(): setup_logging(2)
 def trace(): setup_logging(3)
+info()
 
 # ---------------- Subtensor ----------------
 SUBTENSOR = None
@@ -69,7 +74,7 @@ async def CHUTES(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm
     if aiohttp is None:
         return None
     client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
-    sem = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
+    sem = asyncio.Semaphore(int(os.getenv("SN1_HTTP_CONCURRENCY", "16")))
     for attempt in range(1, retries + 2):
         try:
             payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
@@ -119,7 +124,7 @@ def rpc(method: str, *args, base_url: Optional[str] = None, timeout: int = 60, *
         return data.get("result")
     raise RuntimeError((isinstance(data, dict) and data.get("error")) or "remote error")
 
-def out_func(*, x: int = 1) -> int:
+def func(*, x: int = 1) -> int:
     return x + 1
 
 async def llm_tool(*, prompt: str, model: str = "unsloth/gemma-3-12b-it", timeout: int = 150):
@@ -127,7 +132,7 @@ async def llm_tool(*, prompt: str, model: str = "unsloth/gemma-3-12b-it", timeou
 
 class tools:
     @staticmethod
-    def out_func(*, x: int = 1, base_url: Optional[str] = None, timeout: int = 60):
+    def func(*, x: int = 1, base_url: Optional[str] = None, timeout: int = 60):
         return rpc("out_func", x=x, base_url=base_url, timeout=timeout)
     
     @staticmethod
@@ -137,15 +142,15 @@ class tools:
 # Register tools.
 def _register_default_methods() -> None:
     from .server import register
-    register("out_func", out_func)
+    register("func", func)
     register("llm", llm_tool)
 _register_default_methods()
 
 # ---------------- Get Agent. ----------------
-async def get_agent( uid:int ) -> str:
+async def pull_agent( uid:int, path:str = None) -> str:
     try:
         sub = await sn1.get_subtensor()
-        g = (await sub.get_revealed_commitment(NETUID,0))[0][1]
+        g = (await sub.get_commitment(NETUID,0))[0][1]
         if g.startswith("http") and "api.github.com" not in g: g = f"https://api.github.com/gists/{g.rstrip('/').split('/')[-1]}"
         if not g.startswith("http"): g = f"https://api.github.com/gists/{g}"
         async with aiohttp.ClientSession() as s:
@@ -154,12 +159,17 @@ async def get_agent( uid:int ) -> str:
             content = meta.get("content")
             if content is None or meta.get("truncated"):
                 async with s.get(meta["raw_url"]) as r: content = await r.text()
-        fd, name = tempfile.mkstemp(prefix="agent_", suffix=f"_{meta.get('filename','file.txt')}")
-        os.close(fd)
+        if path == None:
+            fd, name = tempfile.mkstemp(prefix="agent_", suffix=f"_{meta.get('filename','file.txt')}")
+            os.close(fd)
+        else:
+            name = path
         async with aiofiles.open(name,"w",encoding="utf-8") as f: await f.write(content or "")
         return str(Path(name).resolve())
-    except: 
+    except Exception as e: 
+        logger.warning(f'Failed pulling agent on uid: {uid} with error: {e}')
         return None
+
 
 # ---------------- CLI ----------------
 @click.group()
@@ -181,8 +191,8 @@ async def watchdog(timeout: int = 300):
 # ---------------- Runner ----------------
 @cli.command("validator")
 def validator():
-    coldkey = get_conf("BT_WALLET_COLD", "default")
-    hotkey = get_conf("BT_WALLET_HOT", "default")
+    coldkey = get_conf("BT_WALLET_COLD", except_input=True)
+    hotkey = get_conf("BT_WALLET_HOT", except_input=True)
     wallet = bt.wallet(name=coldkey, hotkey=hotkey)
     logger.debug(f"Validator initialized with wallet: {coldkey}/{hotkey}")
 
@@ -207,7 +217,7 @@ def validator():
                 
                 for uid in uids:
                     logger.debug(f"Processing UID {uid}")
-                    gen_tmp_file: str = await get_agent( uid )
+                    gen_tmp_file: str = await pull_agent( uid )
                     logger.debug(f"Retrieved agent file for UID {uid}: {gen_tmp_file}")
                     gen_tmp_file = "gen.py"
                     logger.debug(f"Using hardcoded agent file: {gen_tmp_file}")
@@ -262,3 +272,55 @@ def validator():
         await asyncio.gather(_run(), watchdog(timeout=60 * 10))
 
     asyncio.run(main())
+
+@cli.command("push")
+@click.argument("path", default="agent.py")
+def push( path:str ):
+    coldkey = get_conf("BT_WALLET_COLD", except_input=True)
+    hotkey = get_conf("BT_WALLET_HOT", except_input=True)
+    github_token = get_conf("GITHUB_TOKEN", except_input=True)
+    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
+
+    async def main():
+        logger.info('Loading chain state ...')
+        sub = await get_subtensor()
+        metagraph = await sub.metagraph(NETUID)
+        if wallet.hotkey.ss58_address not in metagraph.hotkeys:
+            logger.warning(f"Not registered, first register your wallet `btcli subnet register --netuid {NETUID} --wallet.name {coldkey} --hotkey {hotkey}`")
+            os._exit(1)
+
+        with open(path, 'r') as f:
+            content = f.read()
+        scheme = "token" if github_token.startswith(("ghp_", "github_pat_")) else "Bearer"
+        headers = {
+            "Authorization": f"{scheme} {github_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "sn1-cli"
+        }
+        gist_data = {"description": "Agent code", "public": True, "files": {os.path.basename(path): {"content": content}}}
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.github.com/gists", json=gist_data, headers=headers) as resp:
+                if resp.status != 201:
+                    try:
+                        error_json = await resp.json()
+                        error_msg = error_json.get("message") or str(error_json)
+                    except Exception:
+                        error_msg = await resp.text()
+                    raise RuntimeError(
+                        f"Failed to create gist ({resp.status}): {error_msg}. Ensure your GITHUB_TOKEN is valid and has 'gist' scope, visit: https://github.com/settings/tokens/new"
+                    )
+                gist_url = (await resp.json())["html_url"]
+                logger.info(f"Created gist: {gist_url}")
+        
+        await sub.set_commitment(wallet=wallet, netuid=NETUID, data=gist_url)
+        logger.info(f"Committed gist URL to blockchain.")
+    
+    asyncio.run(main())
+    
+@cli.command("pull")
+@click.argument("uid", type=int)
+@click.argument("path", default="agent.py")
+def pull( uid:int, path:str ):
+    asyncio.run(pull_agent(uid, path))
+
