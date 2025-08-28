@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  runner:
+    image: thebes1618/sn1:latest
+    container_name: sn1-runner
+    restart: unless-stopped
+    mem_reservation: "6g"
+    mem_limit:       "8g"
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env:ro
+    command: ["-vv", "runner"]
+
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: sn1-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: --interval 15 sn1-runner
+
+ 

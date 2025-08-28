@@ -1,0 +1,26 @@
+[project]
+name = "sn1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9,<3.12"
+dependencies = [
+    "bittensor>=9.9.0",
+    "bittensor-cli>=9.10.1",
+    "click>=8.0.0",
+    "dotenv>=0.9.9",
+]
+
+[project.scripts]
+sn1 = "sn1:cli"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sn1"]
+
+[tool.uv.sources]
+sn1 = { path = ".", editable = true }
+

@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+sn1/__init__.py
+sn1.egg-info/PKG-INFO
+sn1.egg-info/SOURCES.txt
+sn1.egg-info/dependency_links.txt
+sn1.egg-info/entry_points.txt
+sn1.egg-info/requires.txt
+sn1.egg-info/top_level.txt

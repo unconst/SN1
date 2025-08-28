@@ -1,0 +1,2 @@
+[console_scripts]
+sn1 = sn1:cli

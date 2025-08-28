@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: sn1
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: bittensor>=9.9.0
+Requires-Dist: bittensor-cli>=9.10.1
+Requires-Dist: click>=8.2.1
+Requires-Dist: dotenv>=0.9.9
+
+# SN1
