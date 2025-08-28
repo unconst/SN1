@@ -1,6 +1,7 @@
 # sn1/__init__.py
 from __future__ import annotations
 import os
+import re
 import uuid
 import time
 import click
@@ -9,11 +10,16 @@ import aiohttp
 import uvicorn
 import asyncio
 import logging
+import tempfile
+import aiofiles
 import traceback
 import bittensor as bt 
+from pathlib import Path
 from dotenv import load_dotenv
 from typing import Any
 load_dotenv(override=True)
+
+NETUID = 1
 
 # ---------------- Config ----------------
 def get_conf(key, default=None) -> Any:
@@ -143,6 +149,23 @@ def _register_default_methods() -> None:
     register("searc", search)
 _register_default_methods()
 
+# ---------------- Get Agent. ----------------
+async def get_agent(uid:int)->str:
+    sub = await sn1.get_subtensor()
+    g = (await sub.get_revealed_commitment(NETUID,0))[0][1]
+    if g.startswith("http") and "api.github.com" not in g: g = f"https://api.github.com/gists/{g.rstrip('/').split('/')[-1]}"
+    if not g.startswith("http"): g = f"https://api.github.com/gists/{g}"
+    async with aiohttp.ClientSession() as s:
+        async with s.get(g) as r: data = await r.json()
+        meta = next(iter(data["files"].values()))
+        content = meta.get("content")
+        if content is None or meta.get("truncated"):
+            async with s.get(meta["raw_url"]) as r: content = await r.text()
+    fd, name = tempfile.mkstemp(prefix="agent_", suffix=f"_{meta.get('filename','file.txt')}")
+    os.close(fd)
+    async with aiofiles.open(name,"w",encoding="utf-8") as f: await f.write(content or "")
+    return str(Path(name).resolve())
+
 # ---------------- CLI ----------------
 @click.group()
 @click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
@@ -176,12 +199,25 @@ def runner():
             global HEARTBEAT
             try:
                 HEARTBEAT = time.monotonic()
-                # Demo: call functions on arbitrary script
-                with Container("gen.py") as c:
-                    # These will work if gen.py defines matching functions via boot.py @entrypoint or raw defs
-                    print(c.__list__() if hasattr(c, "__list__") else [])
-                    print(c.func(z="cat"))
-                await asyncio.sleep(10)
+                for uid in range(256):
+                    tmp_agent_path:str = await get_agent( uid )    
+                    with Container( tmp_agent_path ) as c:
+                        total = 10                       
+                        success = 0
+                        for _ in range(total):
+                            try:
+                                x = random.random()
+                                y = random.random()
+                                z = x * y
+                                prompt = f"what is {x} * {y}?, return you answer like <Answer>12.232</Answer>"
+                                response = c.llm(prompt = prompt )
+                                match = re.search(r'<Answer>(.*?)</Answer>', response)
+                                if match:
+                                    parsed_answer = float(match.group(1))
+                                    if abs(parsed_answer - z) <= 1e-6:
+                                        success += 1
+                            except: pass
+                
             except asyncio.CancelledError:
                 break
             except Exception as e:
