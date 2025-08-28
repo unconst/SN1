@@ -2,11 +2,30 @@ Metadata-Version: 2.4
 Name: sn1
 Version: 0.1.0
 Summary: Add your description here
-Requires-Python: >=3.10
+Requires-Python: <3.12,>=3.9
 Description-Content-Type: text/markdown
+Requires-Dist: aiohttp>=3.10.11
 Requires-Dist: bittensor>=9.9.0
 Requires-Dist: bittensor-cli>=9.10.1
-Requires-Dist: click>=8.2.1
+Requires-Dist: click>=8.0.0
 Requires-Dist: dotenv>=0.9.9
+Requires-Dist: fastapi<0.111.0,>=0.110.1
+Requires-Dist: flask>=3.1.2
+Requires-Dist: ipykernel>=6.30.1
+Requires-Dist: requests>=2.32.5
+Requires-Dist: uvicorn>=0.35.0
 
 # SN1
+
+## Validating
+Set env vars, chutes api key.
+```bash
+# Copy .env and fill out validator items
+cp .env.example .env
+```
+
+Run the validator with docker and watchtower autoupdate.
+```bash
+# Run the validator with watchtower.
+docker-compose down && docker-compose pull && docker-compose up -d && docker-compose logs -f
+```

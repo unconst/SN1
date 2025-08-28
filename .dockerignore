@@ -1,0 +1,28 @@
+# Git
+.git
+.gitignore
+
+# Python
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.python-version
+affine.egg-info
+
+# Cache
+.cache
+
+# Notebooks
+notebooks/
+
+# Local env files
+.env
+.env.*
+!/.env.validator.example
+
+# OS specific
+.DS_Store
+Thumbs.db 

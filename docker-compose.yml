@@ -11,7 +11,24 @@ services:
       - .env
     volumes:
       - ./.env:/app/.env:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
     command: ["-vv", "runner"]
+
+
+  validator:
+    image: thebes1618/sn1:latest
+    container_name: sn1-validator
+    restart: unless-stopped
+    mem_reservation: "6g"
+    mem_limit:       "8g"
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+    command: ["-vv", "validator"]
 
 
   watchtower:
@@ -20,6 +37,4 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 15 sn1-runner
-
- 
+    command: --interval 15 sn1-runner sn1-validator
