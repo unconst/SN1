@@ -2,6 +2,8 @@
 .git
 .gitignore
 
+agents/*
+
 # Python
 .venv
 .pytest_cache

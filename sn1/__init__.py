@@ -147,30 +147,49 @@ def _register_default_methods() -> None:
 _register_default_methods()
 
 # ---------------- Get Agent. ----------------
-async def pull_agent( uid:int, path:str = None) -> str:
+async def pull_agent(uid: int) -> str:
     try:
-        sub = await sn1.get_subtensor()
-        g = (await sub.get_commitment(NETUID,0))[0][1]
-        if g.startswith("http") and "api.github.com" not in g: g = f"https://api.github.com/gists/{g.rstrip('/').split('/')[-1]}"
-        if not g.startswith("http"): g = f"https://api.github.com/gists/{g}"
+        print(f"Starting to pull agent for uid: {uid}")
+        sub = await get_subtensor()
+        logger.debug(f"Got subtensor: {sub}")
+        commit = await sub.get_revealed_commitment(netuid = NETUID, uid = uid)
+        print (commit)
+        g = commit[0][1]
+        block = commit[0][0]
+        print(f"Got commitment: {g}")
+        if g.startswith("http") and "api.github.com" not in g:
+            g = f"https://api.github.com/gists/{g.rstrip('/').split('/')[-1]}"
+            print(f"Converted to gist URL: {g}")
+        if not g.startswith("http"):
+            g = f"https://api.github.com/gists/{g}"
+            print(f"Added gist prefix: {g}")
+        print(f"Final gist URL: {g}")
         async with aiohttp.ClientSession() as s:
-            async with s.get(g) as r: data = await r.json()
+            logger.debug(f"Making request to gist URL: {g}")
+            async with s.get(g) as r:
+                data = await r.json()
+            logger.debug(f"Got gist data: {list(data.get('files', {}).keys())}")
             meta = next(iter(data["files"].values()))
+            logger.debug(f"Got file metadata: {meta.keys()}")
             content = meta.get("content")
             if content is None or meta.get("truncated"):
-                async with s.get(meta["raw_url"]) as r: content = await r.text()
-        if path == None:
-            fd, name = tempfile.mkstemp(prefix="agent_", suffix=f"_{meta.get('filename','file.txt')}")
-            os.close(fd)
-        else:
-            name = path
-        async with aiofiles.open(name,"w",encoding="utf-8") as f: await f.write(content or "")
-        return str(Path(name).resolve())
-    except Exception as e: 
+                logger.debug(f"Content is None or truncated, fetching raw content from: {meta['raw_url']}")
+                async with s.get(meta["raw_url"]) as r:
+                    content = await r.text()
+            logger.debug(f"Got content, length: {len(content) if content else 0}")
+        dir = f"agents/{uid}/{block}/" 
+        Path(dir).mkdir(parents=True, exist_ok=True)
+        name = f"{dir}agent.py"
+        logger.debug(f"Writing agent to: {name}")
+        async with aiofiles.open(name, "w", encoding="utf-8") as f:
+            await f.write(content or "")
+        resolved_path = str(Path(name).resolve())
+        logger.debug(f"Successfully pulled agent to: {resolved_path}")
+        return resolved_path
+    except Exception as e:
         logger.warning(f'Failed pulling agent on uid: {uid} with error: {e}')
         return None
-
-
+    
 # ---------------- CLI ----------------
 @click.group()
 @click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
@@ -187,6 +206,65 @@ async def watchdog(timeout: int = 300):
         if elapsed > timeout:
             logging.error(f"[WATCHDOG] Process stalled {elapsed:.0f}s — exiting process.")
             os._exit(1)
+    
+    
+@cli.command("push")
+@click.argument("path", default="agents/base_agent.py")
+def push( path:str ):
+    coldkey = get_conf("BT_WALLET_COLD", except_input=True)
+    hotkey = get_conf("BT_WALLET_HOT", except_input=True)
+    github_token = get_conf("GITHUB_TOKEN", except_input=True)
+    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
+    async def main():
+        logger.info('Loading chain state ...')
+        sub = await get_subtensor()
+        metagraph = await sub.metagraph(NETUID)
+        if wallet.hotkey.ss58_address not in metagraph.hotkeys:
+            logger.warning(f"Not registered, first register your wallet `btcli subnet register --netuid {NETUID} --wallet.name {coldkey} --hotkey {hotkey}`")
+            os._exit(1)
+        logger.info(f'UID: {metagraph.hotkeys.index(wallet.hotkey.ss58_address)}')
+
+        with open(path, 'r') as f:
+            content = f.read()
+        scheme = "token" if github_token.startswith(("ghp_", "github_pat_")) else "Bearer"
+        headers = {
+            "Authorization": f"{scheme} {github_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "sn1-cli"
+        }
+        gist_data = {"description": "Agent code", "public": True, "files": {os.path.basename(path): {"content": content}}}
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://api.github.com/gists", json=gist_data, headers=headers) as resp:
+                if resp.status != 201:
+                    try:
+                        error_json = await resp.json()
+                        error_msg = error_json.get("message") or str(error_json)
+                    except Exception:
+                        error_msg = await resp.text()
+                    raise RuntimeError(
+                        f"Failed to create gist ({resp.status}): {error_msg}. Ensure your GITHUB_TOKEN is valid and has 'gist' scope, visit: https://github.com/settings/tokens/new"
+                    )
+                gist_url = (await resp.json())["html_url"]
+                logger.info(f"Created gist: {gist_url}")
+        
+        await sub.set_reveal_commitment(wallet=wallet, netuid=NETUID, data=gist_url, blocks_until_reveal = 1)
+        logger.info(f"Committed gist URL to blockchain.")
+    
+    asyncio.run(main())
+    
+@cli.command("pull")
+@click.argument("uid", type=int, required=False)
+def pull( uid:int = None):
+    if uid is not None:
+        asyncio.run(pull_agent(uid))
+    else:
+        async def pull_all():
+            sub = await get_subtensor()
+            metagraph = await sub.metagraph(NETUID)
+            for uid in metagraph.uids:
+                await pull_agent(int(uid))
+        asyncio.run(pull_all())
 
 # ---------------- Runner ----------------
 @cli.command("validator")
@@ -273,54 +351,4 @@ def validator():
 
     asyncio.run(main())
 
-@cli.command("push")
-@click.argument("path", default="agent.py")
-def push( path:str ):
-    coldkey = get_conf("BT_WALLET_COLD", except_input=True)
-    hotkey = get_conf("BT_WALLET_HOT", except_input=True)
-    github_token = get_conf("GITHUB_TOKEN", except_input=True)
-    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
-
-    async def main():
-        logger.info('Loading chain state ...')
-        sub = await get_subtensor()
-        metagraph = await sub.metagraph(NETUID)
-        if wallet.hotkey.ss58_address not in metagraph.hotkeys:
-            logger.warning(f"Not registered, first register your wallet `btcli subnet register --netuid {NETUID} --wallet.name {coldkey} --hotkey {hotkey}`")
-            os._exit(1)
-
-        with open(path, 'r') as f:
-            content = f.read()
-        scheme = "token" if github_token.startswith(("ghp_", "github_pat_")) else "Bearer"
-        headers = {
-            "Authorization": f"{scheme} {github_token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "sn1-cli"
-        }
-        gist_data = {"description": "Agent code", "public": True, "files": {os.path.basename(path): {"content": content}}}
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://api.github.com/gists", json=gist_data, headers=headers) as resp:
-                if resp.status != 201:
-                    try:
-                        error_json = await resp.json()
-                        error_msg = error_json.get("message") or str(error_json)
-                    except Exception:
-                        error_msg = await resp.text()
-                    raise RuntimeError(
-                        f"Failed to create gist ({resp.status}): {error_msg}. Ensure your GITHUB_TOKEN is valid and has 'gist' scope, visit: https://github.com/settings/tokens/new"
-                    )
-                gist_url = (await resp.json())["html_url"]
-                logger.info(f"Created gist: {gist_url}")
-        
-        await sub.set_commitment(wallet=wallet, netuid=NETUID, data=gist_url)
-        logger.info(f"Committed gist URL to blockchain.")
-    
-    asyncio.run(main())
-    
-@cli.command("pull")
-@click.argument("uid", type=int)
-@click.argument("path", default="agent.py")
-def pull( uid:int, path:str ):
-    asyncio.run(pull_agent(uid, path))
 
