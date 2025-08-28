@@ -184,8 +184,12 @@ async def watchdog(timeout: int = 300):
             os._exit(1)
 
 # ---------------- Runner ----------------
-@cli.command("runner")
-def runner():
+@cli.command("validator")
+def validator():
+    coldkey = get_conf("BT_WALLET_COLD", "default")
+    hotkey = get_conf("BT_WALLET_HOT", "default")
+    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
+
     async def run_server():
         # You can switch to a Unix socket by using uds="/tmp/sn1.sock" and mounting it into containers
         config = uvicorn.Config("sn1:app", host="0.0.0.0", port=5005, log_level="info")
@@ -199,12 +203,16 @@ def runner():
             global HEARTBEAT
             try:
                 HEARTBEAT = time.monotonic()
-                for uid in range(256):
+                SAMPLES = 10
+                sub = await get_subtensor()
+                metagraph = await sub.metagraph(NETUID)
+                uids = [ int(uid) for uid in metagraph.uids]
+                weights = [ 0 for _ in metagraph.uids ]
+                for uid in uids:
                     tmp_agent_path:str = await get_agent( uid )    
                     with Container( tmp_agent_path ) as c:
-                        total = 10                       
                         success = 0
-                        for _ in range(total):
+                        for _ in range(SAMPLES):
                             try:
                                 x = random.random()
                                 y = random.random()
@@ -217,6 +225,15 @@ def runner():
                                     if abs(parsed_answer - z) <= 1e-6:
                                         success += 1
                             except: pass
+                        weights[uid] = float(success)/SAMPLES                            
+                await sub.set_weights( 
+                    wallet=wallet, 
+                    netuid=NETUID, 
+                    weights=weights, 
+                    uids=uids,
+                    wait_for_inclusion=False,
+                    wait_for_finalization=False
+                )
                 
             except asyncio.CancelledError:
                 break
@@ -228,24 +245,4 @@ def runner():
     async def main():
         await asyncio.gather(_run(), watchdog(timeout=60 * 10), run_server())
 
-    asyncio.run(main())
-
-@cli.command("validator")
-def validator():
-    async def _run():
-        while True:
-            global HEARTBEAT
-            try:
-                HEARTBEAT = time.monotonic()
-                logging.debug('debug')
-                await asyncio.sleep(3)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                traceback.print_exc()
-                logger.info(f"runner error: {e}; retrying...")
-                await asyncio.sleep(5)
-
-    async def main():
-        await asyncio.gather(_run(), watchdog(timeout=60 * 10))
     asyncio.run(main())

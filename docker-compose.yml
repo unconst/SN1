@@ -1,21 +1,6 @@
 version: "3.8"
 
 services:
-  runner:
-    image: thebes1618/sn1:latest
-    container_name: sn1-runner
-    restart: unless-stopped
-    mem_reservation: "6g"
-    mem_limit:       "8g"
-    env_file:
-      - .env
-    volumes:
-      - ./.env:/app/.env:ro
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /usr/bin/docker:/usr/bin/docker:ro
-    command: ["-vv", "runner"]
-
-
   validator:
     image: thebes1618/sn1:latest
     container_name: sn1-validator
@@ -28,8 +13,8 @@ services:
       - ./.env:/app/.env:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/docker:/usr/bin/docker:ro
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
     command: ["-vv", "validator"]
-
 
   watchtower:
     image: containrrr/watchtower
