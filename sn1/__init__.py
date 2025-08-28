@@ -202,12 +202,15 @@ def validator():
         while True:
             global HEARTBEAT
             try:
+                
+                SAMPLES = 10                
                 HEARTBEAT = time.monotonic()
-                SAMPLES = 10
                 sub = await get_subtensor()
+                
                 metagraph = await sub.metagraph(NETUID)
                 uids = [ int(uid) for uid in metagraph.uids]
                 weights = [ 0 for _ in metagraph.uids ]
+                
                 for uid in uids:
                     tmp_agent_path:str = await get_agent( uid )    
                     with Container( tmp_agent_path ) as c:
@@ -225,7 +228,8 @@ def validator():
                                     if abs(parsed_answer - z) <= 1e-6:
                                         success += 1
                             except: pass
-                        weights[uid] = float(success)/SAMPLES                            
+                        weights[uid] = float(success)/SAMPLES    
+                                                
                 await sub.set_weights( 
                     wallet=wallet, 
                     netuid=NETUID, 
