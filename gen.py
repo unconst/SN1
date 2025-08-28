@@ -12,7 +12,3 @@ def in_func( x: int = 1 ):
 @entrypoint()
 def llm( prompt:str ):
     return sn1.tools.llm( prompt = prompt )
-
-@entrypoint() 
-def search( search:str ):
-    return sn1.tools.search( search = search )

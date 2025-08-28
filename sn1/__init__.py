@@ -125,9 +125,6 @@ def out_func(*, x: int = 1) -> int:
 async def llm_tool(*, prompt: str, model: str = "unsloth/gemma-3-12b-it", timeout: int = 150):
     return await CHUTES(prompt, model=model, timeout=timeout)
 
-async def search(*, query: str):
-    return await SEARCH( query = query)
-
 class tools:
     @staticmethod
     def out_func(*, x: int = 1, base_url: Optional[str] = None, timeout: int = 60):
@@ -137,34 +134,32 @@ class tools:
     def llm(*, prompt: str, model: str = "unsloth/gemma-3-12b-it", base_url: Optional[str] = None, timeout: int = 60):
         return rpc("llm", prompt=prompt, model=model, base_url=base_url, timeout=timeout)
     
-    @staticmethod
-    def search(*, query: str = None):
-        return rpc("search", query=query)
-
 # Register tools.
 def _register_default_methods() -> None:
     from .server import register
     register("out_func", out_func)
     register("llm", llm_tool)
-    register("search", search)
 _register_default_methods()
 
 # ---------------- Get Agent. ----------------
-async def get_agent(uid:int)->str:
-    sub = await sn1.get_subtensor()
-    g = (await sub.get_revealed_commitment(NETUID,0))[0][1]
-    if g.startswith("http") and "api.github.com" not in g: g = f"https://api.github.com/gists/{g.rstrip('/').split('/')[-1]}"
-    if not g.startswith("http"): g = f"https://api.github.com/gists/{g}"
-    async with aiohttp.ClientSession() as s:
-        async with s.get(g) as r: data = await r.json()
-        meta = next(iter(data["files"].values()))
-        content = meta.get("content")
-        if content is None or meta.get("truncated"):
-            async with s.get(meta["raw_url"]) as r: content = await r.text()
-    fd, name = tempfile.mkstemp(prefix="agent_", suffix=f"_{meta.get('filename','file.txt')}")
-    os.close(fd)
-    async with aiofiles.open(name,"w",encoding="utf-8") as f: await f.write(content or "")
-    return str(Path(name).resolve())
+async def get_agent( uid:int ) -> str:
+    try:
+        sub = await sn1.get_subtensor()
+        g = (await sub.get_revealed_commitment(NETUID,0))[0][1]
+        if g.startswith("http") and "api.github.com" not in g: g = f"https://api.github.com/gists/{g.rstrip('/').split('/')[-1]}"
+        if not g.startswith("http"): g = f"https://api.github.com/gists/{g}"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(g) as r: data = await r.json()
+            meta = next(iter(data["files"].values()))
+            content = meta.get("content")
+            if content is None or meta.get("truncated"):
+                async with s.get(meta["raw_url"]) as r: content = await r.text()
+        fd, name = tempfile.mkstemp(prefix="agent_", suffix=f"_{meta.get('filename','file.txt')}")
+        os.close(fd)
+        async with aiofiles.open(name,"w",encoding="utf-8") as f: await f.write(content or "")
+        return str(Path(name).resolve())
+    except: 
+        return None
 
 # ---------------- CLI ----------------
 @click.group()
@@ -189,46 +184,61 @@ def validator():
     coldkey = get_conf("BT_WALLET_COLD", "default")
     hotkey = get_conf("BT_WALLET_HOT", "default")
     wallet = bt.wallet(name=coldkey, hotkey=hotkey)
-
-    async def run_server():
-        # You can switch to a Unix socket by using uds="/tmp/sn1.sock" and mounting it into containers
-        config = uvicorn.Config("sn1:app", host="0.0.0.0", port=5005, log_level="info")
-        server = uvicorn.Server(config)
-        await server.serve()
+    logger.debug(f"Validator initialized with wallet: {coldkey}/{hotkey}")
 
     async def _run():
         # Example loop that creates a container and calls into it
         from .docker import Container
+        logger.debug("Starting validator main loop")
         while True:
             global HEARTBEAT
             try:
                 
                 SAMPLES = 10                
                 HEARTBEAT = time.monotonic()
+                logger.debug(f"Heartbeat updated: {HEARTBEAT}")
                 sub = await get_subtensor()
+                logger.debug("Subtensor connection established")
                 
                 metagraph = await sub.metagraph(NETUID)
                 uids = [ int(uid) for uid in metagraph.uids]
                 weights = [ 0 for _ in metagraph.uids ]
+                logger.debug(f"Loaded metagraph with {len(uids)} UIDs: {uids}")
                 
                 for uid in uids:
-                    with Container( await get_agent( uid ) ) as c:
+                    logger.debug(f"Processing UID {uid}")
+                    gen_tmp_file: str = await get_agent( uid )
+                    logger.debug(f"Retrieved agent file for UID {uid}: {gen_tmp_file}")
+                    gen_tmp_file = "gen.py"
+                    logger.debug(f"Using hardcoded agent file: {gen_tmp_file}")
+                    with Container( gen_tmp_file ) as c:
+                        logger.debug(f"Created container for UID {uid}")
                         success = 0
-                        for _ in range(SAMPLES):
+                        for sample_idx in range(SAMPLES):
                             try:
                                 x = random.random()
                                 y = random.random()
                                 z = x * y
                                 prompt = f"what is {x} * {y}?, return you answer like <Answer>12.232</Answer>"
-                                response = c.llm(prompt = prompt )
+                                logger.debug(f"UID {uid} sample {sample_idx}: testing {x} * {y} = {z}")
+                                response = c.llm( prompt = prompt )
+                                logger.debug(f"UID {uid} sample {sample_idx}: got response: {response}")
                                 match = re.search(r'<Answer>(.*?)</Answer>', response)
                                 if match:
                                     parsed_answer = float(match.group(1))
                                     if abs(parsed_answer - z) <= 1e-6:
                                         success += 1
-                            except: pass
-                        weights[uid] = float(success)/SAMPLES    
+                                        logger.debug(f"UID {uid} sample {sample_idx}: correct answer {parsed_answer}")
+                                    else:
+                                        logger.debug(f"UID {uid} sample {sample_idx}: incorrect answer {parsed_answer}, expected {z}")
+                                else:
+                                    logger.debug(f"UID {uid} sample {sample_idx}: no answer found in response")
+                            except Exception as e: 
+                                logger.debug(f"UID {uid} sample {sample_idx}: error - {e}")
+                        weights[uid] = float(success)/SAMPLES
+                        logger.debug(f"UID {uid}: scored {success}/{SAMPLES} = {weights[uid]}")
                                                 
+                logger.debug(f"Setting weights: UIDs={uids}, weights={weights}")
                 await sub.set_weights( 
                     wallet=wallet, 
                     netuid=NETUID, 
@@ -237,8 +247,10 @@ def validator():
                     wait_for_inclusion=False,
                     wait_for_finalization=False
                 )
+                logger.debug("Weights successfully set")
                 
             except asyncio.CancelledError:
+                logger.debug("Validator loop cancelled")
                 break
             except Exception as e:
                 traceback.print_exc()
@@ -246,6 +258,7 @@ def validator():
                 await asyncio.sleep(5)
 
     async def main():
-        await asyncio.gather(_run(), watchdog(timeout=60 * 10), run_server())
+        logger.debug("Starting validator with watchdog")
+        await asyncio.gather(_run(), watchdog(timeout=60 * 10))
 
     asyncio.run(main())
