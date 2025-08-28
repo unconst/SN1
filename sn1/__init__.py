@@ -161,22 +161,16 @@ async def pull_agent(uid: int) -> str:
             logger.debug(f"Added gist prefix: {g}")
         logger.info(f"Final gist URL: {g}")
         async with aiohttp.ClientSession() as s:
-            logger.debug(f"Making request to gist URL: {g}")
             async with s.get(g) as r:
                 data = await r.json()
-            logger.debug(f"Got gist data: {list(data.get('files', {}).keys())}")
             meta = next(iter(data["files"].values()))
-            logger.debug(f"Got file metadata: {meta.keys()}")
             content = meta.get("content")
             if content is None or meta.get("truncated"):
-                logger.debug(f"Content is None or truncated, fetching raw content from: {meta['raw_url']}")
                 async with s.get(meta["raw_url"]) as r:
                     content = await r.text()
-            logger.debug(f"Got content, length: {len(content) if content else 0}")
         dir = f"agents/{uid}/{block}/" 
         Path(dir).mkdir(parents=True, exist_ok=True)
         name = f"{dir}agent.py"
-        logger.debug(f"Writing agent to: {name}")
         async with aiofiles.open(name, "w", encoding="utf-8") as f:
             await f.write(content or "")
         resolved_path = str(Path(name).resolve())
