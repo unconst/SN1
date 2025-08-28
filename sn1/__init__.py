@@ -48,7 +48,6 @@ def setup_logging(verbosity: int):
 def info(): setup_logging(1)
 def debug(): setup_logging(2)
 def trace(): setup_logging(3)
-info()
 
 # ---------------- Subtensor ----------------
 SUBTENSOR = None
@@ -149,21 +148,18 @@ _register_default_methods()
 # ---------------- Get Agent. ----------------
 async def pull_agent(uid: int) -> str:
     try:
-        print(f"Starting to pull agent for uid: {uid}")
+        logger.info(f"Starting to pull agent for uid: {uid}")
         sub = await get_subtensor()
-        logger.debug(f"Got subtensor: {sub}")
         commit = await sub.get_revealed_commitment(netuid = NETUID, uid = uid)
-        print (commit)
         g = commit[0][1]
         block = commit[0][0]
-        print(f"Got commitment: {g}")
         if g.startswith("http") and "api.github.com" not in g:
             g = f"https://api.github.com/gists/{g.rstrip('/').split('/')[-1]}"
-            print(f"Converted to gist URL: {g}")
+            logger.debug(f"Converted to gist URL: {g}")
         if not g.startswith("http"):
             g = f"https://api.github.com/gists/{g}"
-            print(f"Added gist prefix: {g}")
-        print(f"Final gist URL: {g}")
+            logger.debug(f"Added gist prefix: {g}")
+        logger.info(f"Final gist URL: {g}")
         async with aiohttp.ClientSession() as s:
             logger.debug(f"Making request to gist URL: {g}")
             async with s.get(g) as r:
@@ -184,7 +180,7 @@ async def pull_agent(uid: int) -> str:
         async with aiofiles.open(name, "w", encoding="utf-8") as f:
             await f.write(content or "")
         resolved_path = str(Path(name).resolve())
-        logger.debug(f"Successfully pulled agent to: {resolved_path}")
+        logger.info(f"Successfully pulled agent to: {resolved_path}")
         return resolved_path
     except Exception as e:
         logger.warning(f'Failed pulling agent on uid: {uid} with error: {e}')
