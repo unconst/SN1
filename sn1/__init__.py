@@ -146,7 +146,7 @@ def _register_default_methods() -> None:
     from .server import register
     register("out_func", out_func)
     register("llm", llm_tool)
-    register("searc", search)
+    register("search", search)
 _register_default_methods()
 
 # ---------------- Get Agent. ----------------
@@ -212,8 +212,7 @@ def validator():
                 weights = [ 0 for _ in metagraph.uids ]
                 
                 for uid in uids:
-                    tmp_agent_path:str = await get_agent( uid )    
-                    with Container( tmp_agent_path ) as c:
+                    with Container( await get_agent( uid ) ) as c:
                         success = 0
                         for _ in range(SAMPLES):
                             try:
