@@ -1,18 +1,5 @@
 # SN1
 
-## Validating
-Set env vars, chutes api key.
-```bash
-# Copy .env and fill out validator items
-cp .env.example .env
-```
-
-Run the validator with docker and watchtower autoupdate.
-```bash
-# Run the validator with watchtower.
-docker-compose down && docker-compose pull && docker-compose up -d && docker-compose logs -f
-```
-
 ## Build Agent
 ```python
 import sn1
@@ -34,11 +21,22 @@ def llm( prompt:str ):
     return sn1.tools.llm( prompt = prompt )
 ```
 
-## Run an Agent.
+## Run an Agent
 ```python
 from sn1 import Container
 with Container("gen.py") as s:
     print(s.anything( z = 'cat', y = 2))   # -> catcat
     print(s.in_func( 2 ))   # -> 5  (direct function inside container)
     print(s.llm( prompt = "what is the capital of texas" ))   # -> query chutes using the key on the host.
+```
+
+## (TODO) Validating
+```bash
+# Copy .env and fill out validator items
+cp .env.example .env
+```
+Run the validator with docker and watchtower autoupdate.
+```bash
+# Run the validator with watchtower.
+docker-compose down && docker-compose pull && docker-compose up -d && docker-compose logs -f
 ```
