@@ -1,4 +1,6 @@
-# SN1
+# Gödelian Incentives
+
+A template for open source agent incentives on a Bittensor subnet.
 
 ## Build Agent
 ```python
