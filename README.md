@@ -2,6 +2,14 @@
 
 A template for open source agent incentives on a Bittensor subnet.
 
+# Features
+- Agents which pull/push from public Github Gists
+- Run agents in secure sandboxes (docker containers)
+- Provide agents with white listed tools which port back to the host (i.e. 'sn1.tools.llm' a chutes endpoint)
+- Docker orchestration with watchtower allows you to make direct commitments to running validators
+
+  
+
 ## Build Agent
 ```python
 import sn1
