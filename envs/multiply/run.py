@@ -5,8 +5,9 @@ sn1.set_log_level("DEBUG")
 def main():
     spec = sn1.load_env(os.path.dirname(__file__))
     agent = os.path.join(os.path.dirname(__file__), "agent.py")
-    with sn1.Container(agent = agent, spec = spec, ctx={'foo': 'bar'}) as s:
-        print(s.multiply(x = 2, y = 5))
+    with sn1.Container(agent = agent, spec = spec, ctx={'foo': 'bar', 'n_tools': 0}) as s:
+        print(s.multiply(x = 2, y = 5, timeout = 1))
+        print(s.ctx)
 
 if __name__ == "__main__":
     main()

@@ -46,6 +46,10 @@ def rpc(method: str, *args, base_url: Optional[str] = None, timeout: int = 60, *
         return data.get("result")
     raise RuntimeError((isinstance(data, dict) and data.get("error")) or "remote error")
 
+def rpc_raw(method: str, *args, base_url: Optional[str] = None, timeout: int = 60, **kwargs) -> dict[str, Any]:
+    payload = {"method": method, "args": list(args), "kwargs": kwargs}
+    return call_host("/rpc", payload, base_url=base_url, timeout=timeout)
+
 class _ToolsProxy:
     def __getattr__(self, method: str):
         def _call(*args, **kwargs):
@@ -77,6 +81,8 @@ class _ToolsProxy:
             if len(args) == 1 and "prompt" not in kwargs:
                 kwargs["prompt"] = args[0]
                 args = ()
+            # Forward server-execution timeout as meta to avoid colliding with user function params
+            kwargs["__timeout"] = call_timeout
             return rpc(method, *args, base_url=base_url, timeout=call_timeout, **kwargs)
         return _call
 
@@ -176,6 +182,19 @@ class Context:
         except KeyError as e:
             raise AttributeError(f"Context has no attribute '{name}'") from e
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Route unknown attributes into the meta dictionary so that code can do ctx.tokens += n
+        if name in {"token", "method", "request_id", "created_at", "headers", "meta"}:
+            return super().__setattr__(name, value)
+        try:
+            meta = object.__getattribute__(self, "meta")
+            if isinstance(meta, dict):
+                meta[name] = value
+                return
+        except Exception:
+            pass
+        return super().__setattr__(name, value)
+
 def register(name: str, fn: Any) -> None:
     _METHODS[name] = fn
 
@@ -249,22 +268,36 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
                 except Exception:
                     pass
             wants_ctx = _fn_wants_ctx(fn)
+            # Extract optional per-call execution timeout (seconds)
+            exec_timeout: Optional[float] = None
+            try:
+                t = payload.kwargs.pop("__timeout", None)
+                if t is not None:
+                    exec_timeout = float(t)
+            except Exception:
+                exec_timeout = None
             token = _CURRENT_CTX.set(ctx)
             try:
-                if inspect.iscoroutinefunction(fn):
-                    if wants_ctx:
-                        res = await fn(ctx, *payload.args, **payload.kwargs)
+                async def _invoke():
+                    if inspect.iscoroutinefunction(fn):
+                        if wants_ctx:
+                            return await fn(ctx, *payload.args, **payload.kwargs)
+                        return await fn(*payload.args, **payload.kwargs)
                     else:
-                        res = await fn(*payload.args, **payload.kwargs)
+                        if wants_ctx:
+                            return await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
+                        return await run_in_threadpool(fn, *payload.args, **payload.kwargs)
+                if exec_timeout and exec_timeout > 0:
+                    res = await asyncio.wait_for(_invoke(), timeout=exec_timeout)
                 else:
-                    if wants_ctx:
-                        res = await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
-                    else:
-                        res = await run_in_threadpool(fn, *payload.args, **payload.kwargs)
+                    res = await _invoke()
             finally:
                 _CURRENT_CTX.reset(token)
-            return {"ok": True, "result": res}
+            return {"ok": True, "result": res, "ctx": dict(ctx.meta)}
         except Exception as e:
+            # On timeout, asyncio raises TimeoutError from wait_for
+            if isinstance(e, asyncio.TimeoutError):
+                return {"ok": True, "result": None, "timeout": True, "ctx": dict(ctx.meta)}
             logger.error("rpc_error method=%s error=%s", payload.method, e)
             return {"ok": False, "error": str(e)}
 
@@ -622,6 +655,8 @@ class Container:
             method = f"entry:{entry}"
             # Include container-level ctx; allow per-call override via __ctx
             call_kwargs = dict(kwargs)
+            # Extract timeout for both HTTP request and server-execution
+            call_timeout = float(call_kwargs.pop("timeout", 60) or 60)
             call_ctx = self._ctx_payload()
             if "__ctx" in call_kwargs and isinstance(call_kwargs["__ctx"], dict):
                 try:
@@ -631,7 +666,31 @@ class Container:
                 except Exception:
                     pass
             call_kwargs["__ctx"] = call_ctx
-            return rpc(method, *args, base_url=self.base_url, **call_kwargs)
+            # Forward server-execution timeout without colliding with user params
+            call_kwargs["__timeout"] = call_timeout
+            try:
+                data = rpc_raw(method, *args, base_url=self.base_url, timeout=call_timeout, **call_kwargs)
+            except requests.exceptions.Timeout:
+                return None
+            if not isinstance(data, dict):
+                return None
+            # Update local ctx from server, if provided
+            try:
+                returned_ctx = data.get("ctx")
+                if isinstance(returned_ctx, dict):
+                    for k, v in returned_ctx.items():
+                        try:
+                            setattr(self.ctx, k, v)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            if data.get("ok") is True:
+                # Gracefully treat server-side timeouts as None
+                if data.get("timeout") is True:
+                    return None
+                return data.get("result")
+            return None
         finally:
             if prev is None:
                 os.environ.pop("SN1_TOKEN", None)
@@ -639,9 +698,28 @@ class Container:
                 os.environ["SN1_TOKEN"] = prev
 
     def __getattr__(self, name: str):
+        # First, expose context fields directly on the container (e.g., s.tokens)
+        try:
+            ctx = object.__getattribute__(self, "ctx")
+            if hasattr(ctx, name):
+                return getattr(ctx, name)
+        except Exception:
+            pass
         def _caller(*args, **kwargs):
             return self._call(name, *args, **kwargs)
         return _caller
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Route unknown attribute sets to the context so code can do s.tokens = ...
+        reserved = {"image", "local_script_path", "in_container_script_path", "python_path", "container_name", "token", "base_url", "_ctx_source", "ctx", "container_id", "_destroyed"}
+        if name in reserved or name.startswith("_"):
+            return super().__setattr__(name, value)
+        try:
+            ctx = object.__getattribute__(self, "ctx")
+            setattr(ctx, name, value)
+            return
+        except Exception:
+            return super().__setattr__(name, value)
 
     def entries(self) -> list[str]:
         try:
