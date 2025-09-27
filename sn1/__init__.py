@@ -7,22 +7,20 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Callable
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.concurrency import run_in_threadpool
-import os, sys, time, uuid, asyncio, logging, shutil, subprocess, secrets, threading, importlib, importlib.util, inspect, types, io, contextlib
+import os, sys, time, uuid, asyncio, logging, shutil, subprocess, secrets, threading, importlib, importlib.util, inspect, types
+from contextvars import ContextVar
 
-# Centralized logging kept inline for minimal footprint
+# Minimal inline logging setup
+logger = logging.getLogger("sn1")
+if not logger.handlers:
+    _h = logging.StreamHandler(sys.stderr)
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [sn1] %(message)s"))
+    logger.addHandler(_h)
+logger.setLevel(getattr(logging, (os.getenv("SN1_LOGLEVEL") or "INFO").upper(), logging.INFO))
 def _lvl(x):
     return x if isinstance(x, int) else getattr(logging, str(x).upper(), logging.INFO)
-
-def setup_logging(level: str | int | None = None) -> None:
-    lvl = _lvl(level or os.getenv("SN1_LOGLEVEL"))
-    h = logging.StreamHandler(sys.stderr)
-    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
-    r = logging.getLogger("sn1"); r.handlers.clear(); r.addHandler(h); r.setLevel(lvl)
-
 def set_log_level(level: str | int) -> None:
-    logging.getLogger("sn1").setLevel(_lvl(level))
-
-setup_logging(); logger = logging.getLogger("sn1")
+    logger.setLevel(_lvl(level))
 
 # ---------------- Host RPC client ----------------
 def _base_url(base_url: Optional[str] = None) -> str:
@@ -45,16 +43,6 @@ def rpc(method: str, *args, base_url: Optional[str] = None, timeout: int = 60, *
     payload = {"method": method, "args": list(args), "kwargs": kwargs}
     data = call_host("/rpc", payload, base_url=base_url, timeout=timeout)
     if isinstance(data, dict) and data.get("ok") is True:
-        # Surface any stdout/stderr captured on the server side
-        std_out = data.get("stdout")
-        std_err = data.get("stderr")
-        try:
-            if std_out:
-                print(std_out, end="")
-            if std_err:
-                print(std_err, end="", file=sys.stderr)
-        except Exception:
-            pass
         return data.get("result")
     raise RuntimeError((isinstance(data, dict) and data.get("error")) or "remote error")
 
@@ -63,6 +51,29 @@ class _ToolsProxy:
         def _call(*args, **kwargs):
             base_url = kwargs.pop("base_url", None)
             call_timeout = kwargs.pop("timeout", 60)
+            # If running inside container with an active request context, dispatch directly
+            try:
+                active_ctx = _CURRENT_CTX.get()
+            except Exception:
+                active_ctx = None
+            if active_ctx is not None:
+                fn = _METHODS.get(method)
+                if fn is None:
+                    raise RuntimeError(f"unknown method {method}")
+                wants_ctx = _fn_wants_ctx(fn)
+                if inspect.iscoroutinefunction(fn):
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    if loop is None:
+                        if wants_ctx:
+                            return asyncio.run(fn(active_ctx, *args, **kwargs))
+                        return asyncio.run(fn(*args, **kwargs))
+                    # Running inside an event loop; fall back to HTTP path
+                if wants_ctx:
+                    return fn(active_ctx, *args, **kwargs)
+                return fn(*args, **kwargs)
             if len(args) == 1 and "prompt" not in kwargs:
                 kwargs["prompt"] = args[0]
                 args = ()
@@ -70,20 +81,21 @@ class _ToolsProxy:
         return _call
 
 tools = _ToolsProxy()
-# Expose a decorator for registering host-callable tools
-# Usage:
-#   @sn1.tool              -> registers function under its name
-#   @sn1.tool(name="foo") -> registers under custom name
 def tool(_fn: Callable | None = None, *, name: str | None = None):
     return declare_tool(_fn, name=name)
 
 # Entrypoints: decorator and compatibility alias for sn1.boot
 ENTRYPOINTS: dict[str, Callable[..., Any]] = {}
-# Ensure user code can `from sn1.boot import entrypoint`
 sys.modules.setdefault("sn1.boot", sys.modules[__name__])
 
 def entrypoint(_fn: Callable | None = None, *, name: str | None = None):
     def _decorator(fn: Callable) -> Callable:
+        # Mark the function so class-based agents can auto-register bound methods later
+        try:
+            setattr(fn, "__sn1_entrypoint__", True)
+            setattr(fn, "__sn1_entry_name__", name or fn.__name__)
+        except Exception:
+            pass
         # Register entrypoints under a dedicated namespace to avoid colliding with tools
         ep_name = f"entry:{name or fn.__name__}"
         register(ep_name, fn)
@@ -92,6 +104,33 @@ def entrypoint(_fn: Callable | None = None, *, name: str | None = None):
     if _fn is None:
         return _decorator
     return _decorator(_fn)
+
+# ---------------- Lifecycle: Agent base, and state store ----------------
+AGENT_CLASSES: list[type] = []
+AGENT_INSTANCES: list[Any] = []
+_INIT_LOCK = threading.Lock()
+
+class State(dict):
+    pass
+state = State()
+
+class Agent:
+    def __init_subclass__(cls, **kwargs):  # type: ignore[no-untyped-def]
+        super().__init_subclass__(**kwargs)
+        try: AGENT_CLASSES.append(cls)
+        except Exception: pass
+    def init(self, ctx: "Context") -> None: return None
+    def shutdown(self) -> None: return None
+
+def _agent_entry_methods(instance: Any):
+    try:
+        for attr_name, attr in getattr(instance.__class__, "__dict__", {}).items():
+            if callable(attr) and getattr(attr, "__sn1_entrypoint__", False):
+                ep_name = getattr(attr, "__sn1_entry_name__", attr_name)
+                bound = getattr(instance, attr_name)
+                yield str(ep_name), bound
+    except Exception:
+        return
 
 # ---------------- Env loader ----------------
 def load_env(env_or_path: str) -> Namespace:
@@ -105,18 +144,13 @@ def load_env(env_or_path: str) -> Namespace:
     else:
         tools_module = importlib.import_module(f"environments.{env_or_path}.tools")
 
-    if hasattr(tools_module, "register_tools"):
-        tools_module.register_tools()
-
-    allowed_methods = set(getattr(tools_module, "ALLOWED_METHODS", set()))
+    if hasattr(tools_module, "register_tools"): tools_module.register_tools()
     docker_image = getattr(tools_module, "DOCKER_IMAGE", "python:3.11-slim")
     entrypoint = getattr(tools_module, "ENTRYPOINT", "solve")
     defaults = getattr(tools_module, "TOOL_DEFAULTS", None)
-
     return Namespace(
         docker_image=docker_image,
         entrypoint=entrypoint,
-        allowed_methods=allowed_methods,
         defaults=defaults,
     )
 
@@ -125,6 +159,7 @@ def load_env(env_or_path: str) -> Namespace:
 _METHODS: dict[str, Any] = {}
 _TOKEN_META: dict[str, dict[str, Any]] = {}
 _GLOBAL_LIMIT = asyncio.Semaphore(200)
+_CURRENT_CTX: ContextVar["Context | None"] = ContextVar("sn1_current_ctx", default=None)
 
 @dataclass
 class Context:
@@ -135,20 +170,16 @@ class Context:
     headers: dict[str, str] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
 
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.meta[name]
+        except KeyError as e:
+            raise AttributeError(f"Context has no attribute '{name}'") from e
+
 def register(name: str, fn: Any) -> None:
     _METHODS[name] = fn
 
 def declare_tool(_fn: Callable | None = None, *, name: str | None = None):
-    """Decorator to register a function as a callable tool via RPC.
-
-    Usage:
-        @declare_tool
-        def my_tool(...): ...
-
-        or with explicit name:
-        @declare_tool(name="custom")
-        def my_tool(...): ...
-    """
     def _decorator(fn: Callable) -> Callable:
         register(name or fn.__name__, fn)
         return fn
@@ -156,11 +187,10 @@ def declare_tool(_fn: Callable | None = None, *, name: str | None = None):
         return _decorator
     return _decorator(_fn)
 
-def issue_token(ttl_s: int = 3600, per_token_limit: int = 16, allowed_methods: set[str] | None = None) -> str:
+def issue_token(ttl_s: int = 3600, per_token_limit: int = 16) -> str:
     tok = secrets.token_urlsafe(24)
     _TOKEN_META[tok] = {
         "expiry": time.time() + ttl_s,
-        "allowed": set(allowed_methods or []),
         "sem": asyncio.Semaphore(per_token_limit),
     }
     return tok
@@ -178,31 +208,22 @@ class RpcIn(BaseModel):
     kwargs: dict[str, Any] = {}
 
 app = FastAPI()
-
 @app.get("/healthz")
-async def healthz():
-    return {"ok": True}
-
+async def healthz(): return {"ok": True}
 @app.get("/methods")
-async def methods():
-    return {"methods": sorted(_METHODS.keys())}
-
+async def methods(): return {"methods": sorted(_METHODS.keys())}
 def _fn_wants_ctx(fn: Callable) -> bool:
     try:
-        sig = inspect.signature(fn)
-        params = list(sig.parameters.values())
-        if not params:
-            return False
-        p0 = params[0]
-        if p0.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-            return False
-        anno = p0.annotation
-        if isinstance(anno, type):
-            anno_name = getattr(anno, "__name__", "")
-        else:
-            anno_name = str(anno)
-        wants = (p0.name in {"ctx", "_ctx", "context"}) or (anno_name.lower() == "context" or "sn1.Context" in anno_name)
-        return wants
+        return any(
+            (p.name in {"ctx", "context"}) or (
+                p.annotation in (Context, "Context", "sn1.Context")
+            )
+            for p in inspect.signature(fn).parameters.values()
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+        )
     except Exception:
         return False
 
@@ -212,11 +233,7 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
     if not fn:
         raise HTTPException(status_code=404, detail=f"unknown method {payload.method}")
     meta = _TOKEN_META[tok]
-    allowed = meta["allowed"]
-    if allowed and payload.method not in allowed:
-        raise HTTPException(status_code=403, detail=f"method {payload.method} not allowed for this token")
     async with _GLOBAL_LIMIT, meta["sem"]:
-        out_buf, err_buf = io.StringIO(), io.StringIO()
         try:
             ctx = Context(
                 token=tok,
@@ -225,8 +242,6 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
                 created_at=time.time(),
                 headers={k: v for k, v in req.headers.items()},
             )
-            logger.debug("rpc_start id=%s method=%s args=%s kwargs=%s", ctx.request_id, ctx.method, payload.args, list(payload.kwargs.keys()))
-            # Merge client-sent context into ctx.meta (namespaced under __ctx in kwargs)
             extra_ctx = payload.kwargs.pop("__ctx", None)
             if isinstance(extra_ctx, dict):
                 try:
@@ -234,7 +249,8 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
                 except Exception:
                     pass
             wants_ctx = _fn_wants_ctx(fn)
-            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+            token = _CURRENT_CTX.set(ctx)
+            try:
                 if inspect.iscoroutinefunction(fn):
                     if wants_ctx:
                         res = await fn(ctx, *payload.args, **payload.kwargs)
@@ -245,11 +261,48 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
                         res = await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
                     else:
                         res = await run_in_threadpool(fn, *payload.args, **payload.kwargs)
-            logger.debug("rpc_done id=%s method=%s", ctx.request_id, ctx.method)
-            return {"ok": True, "result": res, "stdout": out_buf.getvalue(), "stderr": err_buf.getvalue()}
+            finally:
+                _CURRENT_CTX.reset(token)
+            return {"ok": True, "result": res}
         except Exception as e:
             logger.error("rpc_error method=%s error=%s", payload.method, e)
-            return {"ok": False, "error": str(e), "stdout": out_buf.getvalue(), "stderr": err_buf.getvalue()}
+            return {"ok": False, "error": str(e)}
+
+def _instantiate_agents_and_register() -> dict[str, Any]:
+    with _INIT_LOCK:
+        if AGENT_INSTANCES:
+            return {"initialized": True, "agents": len(AGENT_INSTANCES)}
+        ctx = Context(
+            token=os.getenv("SN1_TOKEN", ""),
+            method="startup",
+            request_id=uuid.uuid4().hex,
+            created_at=time.time(),
+            headers={},
+        )
+        for cls in list(AGENT_CLASSES):
+            try:
+                instance = cls()  # type: ignore[call-arg]
+            except Exception as e:
+                logger.error("failed to instantiate Agent %s: %s", getattr(cls, "__name__", str(cls)), e)
+                continue
+            AGENT_INSTANCES.append(instance)
+            try:
+                init_maybe = getattr(instance, "init", None)
+                if callable(init_maybe):
+                    if inspect.iscoroutinefunction(init_maybe):
+                        # run init synchronously via loop
+                        asyncio.get_event_loop().create_task(init_maybe(ctx))
+                    else:
+                        try:
+                            init_maybe(ctx)
+                        except TypeError:
+                            init_maybe()
+            except Exception as e:
+                logger.error("Agent.init failed for %s: %s", getattr(instance.__class__, "__name__", "Agent"), e)
+            for ep_name, bound in _agent_entry_methods(instance):
+                register(f"entry:{ep_name}", bound)
+                ENTRYPOINTS[ep_name] = bound
+        return {"initialized": True, "agents": len(AGENT_INSTANCES)}
 
 _SERVER_BOOT_LOCK = threading.Lock()
 
@@ -290,29 +343,14 @@ def _load_module_from_file(name: str, file_path: Path):
     spec.loader.exec_module(module)
     return module
 
-def _autoregister_from_env() -> None:
+def _load_default_app_files() -> None:
     try:
-        # Support both module names and file paths via env vars
-        mods = (os.getenv("SN1_IMPORT_MODULES") or "").strip()
-        paths = (os.getenv("SN1_IMPORT_PATHS") or "").strip()
-        if mods:
-            for m in [x.strip() for x in mods.split(",") if x.strip()]:
-                importlib.import_module(m)
-                logger.info(f"sn1: imported module {m}")
-        if paths:
-            for i, p in enumerate([x.strip() for x in paths.split(":" ) if x.strip()]):
-                _p = Path(p)
-                if _p.exists():
-                    _load_module_from_file(f"sn1_autoload_{i}_{_p.stem}", _p)
-                    logger.info(f"sn1: loaded file {_p}")
-        # Fallback to common /app layout
-        if not mods and not paths:
-            for candidate in ["/app/tools.py", "/app/agent.py"]:
-                if os.path.exists(candidate):
-                    _load_module_from_file(f"sn1_autoload_{Path(candidate).stem}", Path(candidate))
-                    logger.info(f"sn1: loaded file {candidate}")
+        for candidate in ["/app/tools.py", "/app/agent.py"]:
+            if os.path.exists(candidate):
+                _load_module_from_file(f"sn1_autoload_{Path(candidate).stem}", Path(candidate))
+                logger.info(f"sn1: loaded file {candidate}")
     except Exception as e:
-        logger.warning(f"autoregister failed: {e}")
+        logger.warning(f"autoload failed: {e}")
 
 def _bootstrap_container_token() -> None:
     fixed = os.getenv("SN1_TOKEN")
@@ -320,7 +358,6 @@ def _bootstrap_container_token() -> None:
         # Accept this token for all methods with a long expiry
         _TOKEN_META[fixed] = {
             "expiry": time.time() + 365 * 24 * 3600,
-            "allowed": set(),
             "sem": asyncio.Semaphore(64),
         }
         logger.info("sn1: accepted container SN1_TOKEN for RPC")
@@ -328,8 +365,31 @@ def _bootstrap_container_token() -> None:
 @app.on_event("startup")
 async def _on_startup():
     _bootstrap_container_token()
-    _autoregister_from_env()
-    logger.info(f"sn1: startup complete; registered {len(_METHODS)} methods")
+    _load_default_app_files()
+    try:
+        res = _instantiate_agents_and_register()
+        logger.info(
+            "sn1: startup complete; registered %d methods; init=%s",
+            len(_METHODS),
+            res,
+        )
+    except Exception as e:
+        logger.error("sn1: initialization failed: %s", e)
+        raise
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    # Call Agent.shutdown hooks
+    for instance in list(AGENT_INSTANCES):
+        try:
+            sd = getattr(instance, "shutdown", None)
+            if callable(sd) and getattr(getattr(sd, "__func__", sd), "__qualname__", "").split(".")[0] != "Agent":
+                if inspect.iscoroutinefunction(sd):
+                    await sd()
+                else:
+                    await run_in_threadpool(sd)
+        except Exception as e:
+            logger.warning("shutdown handler failed for %s: %s", getattr(instance.__class__, "__name__", "Agent"), e)
 
 # Always register a builtin lister
 def _list_methods() -> list[str]:
@@ -355,25 +415,44 @@ def _docker(*args: str, capture_output: bool = True, check: bool = True) -> subp
     docker_bin = _get_docker_bin()
     return _run([docker_bin, *args], capture_output=capture_output, check=check)
 
-def create_running_container(image: str, name: str, env: dict[str, str] | None = None, extra_args: list[str] | None = None) -> str:
+def start_container(
+    image: str,
+    name: str,
+    env: dict[str, str] | None = None,
+    extra_args: list[str] | None = None,
+    copy_mode: bool = False,
+) -> str:
     env = env or {}
     extra_args = extra_args or []
     try:
         _docker("pull", image)
     except Exception as e:
         logger.warning(f"docker pull failed (continuing): {e}")
-    args = [
-        "create", "--entrypoint", "/bin/sh", "--name", name,
-        "--add-host=host.docker.internal:host-gateway",
-    ]
-    for k, v in env.items():
-        args += ["-e", f"{k}={v}"]
-    args += extra_args
-    args += [image, "-c", "sleep infinity"]
-    create = _docker(*args)
-    container_id = create.stdout.strip() or name
-    _docker("start", container_id)
-    return container_id
+    if copy_mode:
+        args = [
+            "run", "-d", "--entrypoint", "/bin/sh", "--name", name,
+            "--add-host=host.docker.internal:host-gateway",
+        ]
+        for k, v in env.items():
+            args += ["-e", f"{k}={v}"]
+        args += extra_args
+        args += [image, "-c", "sleep infinity"]
+        run = _docker(*args)
+        container_id = run.stdout.strip() or name
+        return container_id
+    else:
+        args = [
+            "run", "-d", "--name", name,
+            "--add-host=host.docker.internal:host-gateway",
+            "-p", "0:5005",
+        ]
+        for k, v in env.items():
+            args += ["-e", f"{k}={v}"]
+        args += extra_args
+        args += [image]
+        run = _docker(*args)
+        container_id = run.stdout.strip() or name
+        return container_id
 
 def copy_into_container(container_id: str, src_path: str, dest_path: str):
     _docker("cp", src_path, f"{container_id}:{dest_path}")
@@ -401,25 +480,8 @@ def _container_host_port(container_id: str, internal_port: int = 5005) -> int:
         logger.warning(f"failed to discover published port: {e}")
     raise RuntimeError("could not determine published host port")
 
-def run_detached_container(image: str, name: str, env: dict[str, str] | None = None, extra_args: list[str] | None = None) -> str:
-    env = env or {}
-    extra_args = extra_args or []
-    try:
-        _docker("pull", image)
-    except Exception as e:
-        logger.warning(f"docker pull failed (continuing): {e}")
-    args = [
-        "run", "-d", "--name", name,
-        "--add-host=host.docker.internal:host-gateway",
-        "-p", "0:5005",
-    ]
-    for k, v in env.items():
-        args += ["-e", f"{k}={v}"]
-    args += extra_args
-    args += [image]
-    run = _docker(*args)
-    container_id = run.stdout.strip() or name
-    return container_id
+def copy_into_container(container_id: str, src_path: str, dest_path: str):
+    _docker("cp", src_path, f"{container_id}:{dest_path}")
 
 class Container:
     def __init__(
@@ -431,13 +493,10 @@ class Container:
         python_path: str = "/opt/venv/bin/python",
         base_url: Optional[str] = None,
         token_ttl: int = 3600,
-        allowed_methods: set[str] | None = None,
         ctx: Any | None = None,
     ) -> None:
         if spec is not None:
             image = getattr(spec, "docker_image", image)
-            if allowed_methods is None:
-                allowed_methods = set(getattr(spec, "allowed_methods", set()))
         self.image = image or "thebes1618/sn1:latest"
         self.local_script_path = os.path.abspath(agent) if agent else None
         self.in_container_script_path = f"/app/{os.path.basename(self.local_script_path)}" if self.local_script_path else None
@@ -473,11 +532,12 @@ class Container:
         else:
             if self.local_script_path and os.path.exists(self.local_script_path):
                 # Develop-from-file mode: prepare a container, copy files, and start uvicorn
-                self.container_id = create_running_container(
+                self.container_id = start_container(
                     self.image,
                     self.container_name,
                     env={"SN1_TOKEN": self.token},
                     extra_args=["-p", "0:5005"],
+                    copy_mode=True,
                 )
                 # Ensure working directory exists
                 _ = exec_in_container(self.container_id, "mkdir -p /app")
@@ -504,14 +564,15 @@ class Container:
                 # Start server in background
                 exec_in_container_detach(
                     self.container_id,
-                    "cd /app && SN1_IMPORT_PATHS=/app/tools.py:/app/agent.py /opt/venv/bin/python -m uvicorn sn1:app --host 0.0.0.0 --port 5005",
+                    "cd /app && /opt/venv/bin/python -m uvicorn sn1:app --host 0.0.0.0 --port 5005",
                 )
             else:
                 # Image-only mode: assume image starts uvicorn sn1:app
-                self.container_id = run_detached_container(
+                self.container_id = start_container(
                     self.image,
                     self.container_name,
                     env={"SN1_TOKEN": self.token},
+                    copy_mode=False,
                 )
 
             # Discover mapped host port and set base_url
