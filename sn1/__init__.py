@@ -59,14 +59,18 @@ tools = _ToolsProxy()
 def tool(_fn: Callable | None = None, *, name: str | None = None):
     return declare_tool(_fn, name=name)
 
-# Re-export the entrypoint decorator for agent scripts, but also register to RPC
-from . import boot as _boot
+# Entrypoints: decorator and compatibility alias for sn1.boot
+ENTRYPOINTS: dict[str, Callable[..., Any]] = {}
+# Ensure user code can `from sn1.boot import entrypoint`
+sys.modules.setdefault("sn1.boot", sys.modules[__name__])
+
 def entrypoint(_fn: Callable | None = None, *, name: str | None = None):
     def _decorator(fn: Callable) -> Callable:
         # Register entrypoints under a dedicated namespace to avoid colliding with tools
         ep_name = f"entry:{name or fn.__name__}"
         register(ep_name, fn)
-        return _boot.entrypoint(name=name)(fn)
+        ENTRYPOINTS[name or fn.__name__] = fn
+        return fn
     if _fn is None:
         return _decorator
     return _decorator(_fn)
