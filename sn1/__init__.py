@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Callable
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.concurrency import run_in_threadpool
-import os, sys, time, uuid, json, asyncio, logging, shutil, subprocess, shlex, secrets, threading, importlib, importlib.util, inspect
+import os, sys, time, uuid, json, asyncio, logging, shutil, subprocess, shlex, secrets, threading, importlib, importlib.util, inspect, types, io, contextlib
 
 # Library logging: expose a named logger without configuring handlers/levels.
 logger = logging.getLogger("sn1")
@@ -38,6 +38,16 @@ def rpc(method: str, *args, base_url: Optional[str] = None, timeout: int = 60, *
     payload = {"method": method, "args": list(args), "kwargs": kwargs}
     data = call_host("/rpc", payload, base_url=base_url, timeout=timeout)
     if isinstance(data, dict) and data.get("ok") is True:
+        # Surface any stdout/stderr captured on the server side
+        std_out = data.get("stdout")
+        std_err = data.get("stderr")
+        try:
+            if std_out:
+                print(std_out, end="")
+            if std_err:
+                print(std_err, end="", file=sys.stderr)
+        except Exception:
+            pass
         return data.get("result")
     raise RuntimeError((isinstance(data, dict) and data.get("error")) or "remote error")
 
@@ -209,6 +219,7 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
     if allowed and payload.method not in allowed:
         raise HTTPException(status_code=403, detail=f"method {payload.method} not allowed for this token")
     async with _GLOBAL_LIMIT, meta["sem"]:
+        out_buf, err_buf = io.StringIO(), io.StringIO()
         try:
             ctx = Context(
                 token=tok,
@@ -217,21 +228,29 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
                 created_at=time.time(),
                 headers={k: v for k, v in req.headers.items()},
             )
+            # Merge client-sent context into ctx.meta (namespaced under __ctx in kwargs)
+            extra_ctx = payload.kwargs.pop("__ctx", None)
+            if isinstance(extra_ctx, dict):
+                try:
+                    ctx.meta.update(extra_ctx)
+                except Exception:
+                    pass
             wants_ctx = _fn_wants_ctx(fn)
-            if inspect.iscoroutinefunction(fn):
-                if wants_ctx:
-                    res = await fn(ctx, *payload.args, **payload.kwargs)
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                if inspect.iscoroutinefunction(fn):
+                    if wants_ctx:
+                        res = await fn(ctx, *payload.args, **payload.kwargs)
+                    else:
+                        res = await fn(*payload.args, **payload.kwargs)
                 else:
-                    res = await fn(*payload.args, **payload.kwargs)
-            else:
-                if wants_ctx:
-                    res = await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
-                else:
-                    res = await run_in_threadpool(fn, *payload.args, **payload.kwargs)
-            return {"ok": True, "result": res}
+                    if wants_ctx:
+                        res = await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
+                    else:
+                        res = await run_in_threadpool(fn, *payload.args, **payload.kwargs)
+            return {"ok": True, "result": res, "stdout": out_buf.getvalue(), "stderr": err_buf.getvalue()}
         except Exception as e:
             logger.error(f"rpc error in {payload.method}: {e}")
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": str(e), "stdout": out_buf.getvalue(), "stderr": err_buf.getvalue()}
 
 _SERVER_BOOT_LOCK = threading.Lock()
 
@@ -414,6 +433,7 @@ class Container:
         base_url: Optional[str] = None,
         token_ttl: int = 3600,
         allowed_methods: set[str] | None = None,
+        ctx: Any | None = None,
     ) -> None:
         if spec is not None:
             image = getattr(spec, "docker_image", image)
@@ -428,6 +448,12 @@ class Container:
         # Generate a shared token used by host<->container HTTP
         self.token = secrets.token_urlsafe(24)
         self.base_url = (base_url or "").rstrip("/")
+        # User-provided call context (exposed locally and sent with RPC requests)
+        self._ctx_source = ctx or {}
+        try:
+            self.ctx = types.SimpleNamespace(**(self._ctx_source if isinstance(self._ctx_source, dict) else {"value": self._ctx_source}))
+        except Exception:
+            self.ctx = types.SimpleNamespace()
 
         # Ensure local server if pointing to host
         try:
@@ -518,13 +544,34 @@ class Container:
         if self._destroyed:
             raise RuntimeError("Container has been destroyed")
 
+    def _ctx_payload(self) -> dict[str, Any]:
+        try:
+            if isinstance(self._ctx_source, dict):
+                return dict(self._ctx_source)
+            if hasattr(self.ctx, "__dict__"):
+                return dict(self.ctx.__dict__)
+        except Exception:
+            pass
+        return {}
+
     def _call(self, entry: str, *args, **kwargs):
         self._ensure_active()
         prev = os.environ.get("SN1_TOKEN")
         os.environ["SN1_TOKEN"] = self.token
         try:
             method = f"entry:{entry}"
-            return rpc(method, *args, base_url=self.base_url, **kwargs)
+            # Include container-level ctx; allow per-call override via __ctx
+            call_kwargs = dict(kwargs)
+            call_ctx = self._ctx_payload()
+            if "__ctx" in call_kwargs and isinstance(call_kwargs["__ctx"], dict):
+                try:
+                    merged = dict(call_ctx)
+                    merged.update(call_kwargs["__ctx"])  # per-call takes precedence
+                    call_ctx = merged
+                except Exception:
+                    pass
+            call_kwargs["__ctx"] = call_ctx
+            return rpc(method, *args, base_url=self.base_url, **call_kwargs)
         finally:
             if prev is None:
                 os.environ.pop("SN1_TOKEN", None)
