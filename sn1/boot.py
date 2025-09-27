@@ -5,11 +5,13 @@ ENTRYPOINTS: Dict[str, Callable[..., Any]] = {}
 # Ensure user code can `from sn1.boot import entrypoint`
 sys.modules.setdefault("sn1.boot", sys.modules[__name__])
 
-def entrypoint(name: Optional[str] = None):
+def entrypoint(_fn: Optional[Callable[..., Any]] = None, *, name: Optional[str] = None):
     def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         ENTRYPOINTS[name or fn.__name__] = fn
         return fn
-    return _decorator
+    if _fn is None:
+        return _decorator
+    return _decorator(_fn)
 
 def _load_module_from_path(path: str) -> types.ModuleType:
     path = os.path.abspath(path)

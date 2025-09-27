@@ -8,12 +8,14 @@ import aiohttp
 import asyncio
 import aiofiles
 import traceback
+import logging
 import bittensor as bt
 from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
+from sn1 import Container
 
-from sn1 import setup_logging, get_conf, logger
-from sn1.docker import Container
+logger = logging.getLogger("neurons")
 
 NETUID = 1
 
@@ -22,13 +24,13 @@ SUBTENSOR = None
 async def get_subtensor():
     global SUBTENSOR
     if SUBTENSOR is None:
-        logger.trace("Making Bittensor connection...")
+        logger.debug("Making Bittensor connection...")
         if bt is None:
             raise RuntimeError("bittensor not installed")
-        SUBTENSOR = bt.async_subtensor(get_conf('SUBTENSOR_ENDPOINT', default='wss://lite.sub.latent.to:443'))
+        SUBTENSOR = bt.async_subtensor(os.getenv('SUBTENSOR_ENDPOINT', 'wss://lite.sub.latent.to:443'))
         try:
             await SUBTENSOR.initialize()
-            logger.trace("Connected")
+            logger.debug("Connected")
         except Exception as e:
             os._exit(1)
     return SUBTENSOR
@@ -72,17 +74,25 @@ async def pull_agent(uid: int) -> Optional[str]:
 
 # ---------------- CLI ----------------
 @click.group()
-@click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
-def cli(verbose):
-    setup_logging(verbose)
+@click.option('--log-level', type=click.Choice(['CRITICAL','ERROR','WARNING','INFO','DEBUG'], case_sensitive=False), default=None, help='Logging level (or set LOG_LEVEL env)')
+def cli(log_level: Optional[str]):
+    load_dotenv(override=True)
+    level_name = (log_level or os.getenv('LOG_LEVEL') or 'INFO').upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(level=level, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 
 @cli.command("push")
 @click.argument("path", default="agents/base_agent.py")
 def push(path: str):
-    coldkey = get_conf("BT_WALLET_COLD", except_input=True)
-    hotkey = get_conf("BT_WALLET_HOT", except_input=True)
-    github_token = get_conf("GITHUB_TOKEN", except_input=True)
+    def require_env(name: str) -> str:
+        value = os.getenv(name)
+        if not value:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return value
+    coldkey = require_env("BT_WALLET_COLD")
+    hotkey = require_env("BT_WALLET_HOT")
+    github_token = require_env("GITHUB_TOKEN")
     wallet = bt.wallet(name=coldkey, hotkey=hotkey)
 
     async def main():
@@ -101,7 +111,7 @@ def push(path: str):
             "Authorization": f"{scheme} {github_token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "sn1-cli"
+            "User-Agent": "neurons-cli"
         }
         gist_data = {"description": "Agent code", "public": True, "files": {os.path.basename(path): {"content": content}}}
         async with aiohttp.ClientSession() as session:
@@ -151,8 +161,13 @@ async def watchdog(timeout: int = 300):
 
 @cli.command("validator")
 def validator():
-    coldkey = get_conf("BT_WALLET_COLD", except_input=True)
-    hotkey = get_conf("BT_WALLET_HOT", except_input=True)
+    def require_env(name: str) -> str:
+        value = os.getenv(name)
+        if not value:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return value
+    coldkey = require_env("BT_WALLET_COLD")
+    hotkey = require_env("BT_WALLET_HOT")
     wallet = bt.wallet(name=coldkey, hotkey=hotkey)
     logger.debug(f"Validator initialized with wallet: {coldkey}/{hotkey}")
 

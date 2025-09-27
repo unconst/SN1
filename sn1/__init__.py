@@ -1,43 +1,14 @@
 from __future__ import annotations
-import os, sys, time, uuid, json, asyncio, logging, shutil, subprocess, shlex, secrets, threading, importlib, importlib.util
-from pathlib import Path
-from typing import Any, Optional, Callable
 import requests
-from pydantic import BaseModel
-from fastapi import FastAPI, Request, HTTPException, Depends
+from pathlib import Path
 from argparse import Namespace
-from dotenv import load_dotenv
-import click
+from pydantic import BaseModel
+from typing import Any, Optional, Callable
+from fastapi import FastAPI, Request, HTTPException, Depends
+import os, sys, time, uuid, json, asyncio, logging, shutil, subprocess, shlex, secrets, threading, importlib, importlib.util
 
-load_dotenv(override=True)
-
-# ---------------- Minimal config ----------------
-def get_conf(key: str, default: Any | None = None, *, prompt_if_missing: bool = False) -> Any:
-    v = os.getenv(key)
-    if (not v) and (default is None):
-        if prompt_if_missing:
-            v = input(f"Enter value for {key}: ")
-            os.environ[key] = v
-            return v
-        raise ValueError(f"{key} not set. Set it in .env or the environment.")
-    return v or default
-
-# ---------------- Logging ----------------
-TRACE = 5
-logging.addLevelName(TRACE, "TRACE")
-def _trace(self, msg, *args, **kwargs):
-    if self.isEnabledFor(TRACE):
-        self._log(TRACE, msg, args, **kwargs)
-logging.Logger.trace = _trace  # type: ignore[attr-defined]
+# Library logging: expose a named logger without configuring handlers/levels.
 logger = logging.getLogger("sn1")
-def setup_logging(verbosity: int) -> None:
-    level = TRACE if verbosity >= 3 else logging.DEBUG if verbosity == 2 else logging.INFO if verbosity == 1 else logging.CRITICAL + 1
-    for noisy in [
-        "websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio",
-        "aiobotocore.regions", "botocore", "uvicorn.access",
-    ]:
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-    logging.basicConfig(level=level, format="[%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 # ---------------- Host RPC client ----------------
 def _base_url(base_url: Optional[str] = None) -> str:
@@ -80,8 +51,15 @@ class _ToolsProxy:
         return _call
 
 tools = _ToolsProxy()
-def tool(name: str, /, **kwargs):
-    return getattr(tools, name)(**kwargs)
+# Expose a decorator for registering host-callable tools
+# Usage:
+#   @sn1.tool              -> registers function under its name
+#   @sn1.tool(name="foo") -> registers under custom name
+def tool(_fn: Callable | None = None, *, name: str | None = None):
+    return declare_tool(_fn, name=name)
+
+# Re-export the entrypoint decorator for agent scripts
+from .boot import entrypoint as entrypoint
 
 # ---------------- Env loader ----------------
 def load_env(env_or_path: str) -> Namespace:
@@ -270,11 +248,10 @@ def stop_and_remove_container(container_id: str):
     _docker("rm", "-f", container_id, check=False)
 
  
-
 class Container:
     def __init__(
         self,
-        path_to_script: str,
+        agent: str,
         image: str | None = None,
         *,
         spec: Any | None = None,
@@ -288,7 +265,7 @@ class Container:
             if allowed_methods is None:
                 allowed_methods = set(getattr(spec, "allowed_methods", set()))
         self.image = image or "thebes1618/sn1:latest"
-        self.local_script_path = os.path.abspath(path_to_script)
+        self.local_script_path = os.path.abspath(agent)
         self.in_container_script_path = f"/app/{os.path.basename(self.local_script_path)}"
         self.python_path = python_path
         self.container_name = f"sn1-{os.path.splitext(os.path.basename(self.local_script_path))[0]}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -398,32 +375,4 @@ class Container:
             pass
         return False
 
-# ---------------- CLI ----------------
-@click.group()
-@click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
-def cli(verbose):
-    setup_logging(verbose)
-
-@cli.group()
-def env():
-    """Environment utilities"""
-    pass
-
-@env.command("run")
-@click.argument("env_name_or_path")
-@click.option("--agent", "agent_path", required=True, help="Path to agent script (e.g., gen.py)")
-@click.option("--entry", "entry", default=None, help="Entrypoint function name (defaults to env ENTRYPOINT)")
-@click.option("--prompt", default=None, help="Prompt to pass if the entry expects it")
-@click.option("--samples", type=int, default=1, help="Number of times to invoke the entrypoint")
-def env_run(env_name_or_path: str, agent_path: str, entry: str | None, prompt: str | None, samples: int):
-    spec = load_env(env_name_or_path)
-    entry_name = entry or getattr(spec, "entrypoint", "solve")
-    with Container(agent_path, spec=spec) as c:
-        fn = getattr(c, entry_name)
-        for _ in range(samples):
-            kwargs = {}
-            if prompt is not None:
-                kwargs["prompt"] = prompt
-            res = fn(**kwargs)
-            click.echo(res)
-
+ 

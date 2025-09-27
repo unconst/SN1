@@ -19,7 +19,6 @@ dependencies = [
 ]
 
 [project.scripts]
-sn1 = "sn1:cli"
 neurons = "neurons:cli"
 
 [build-system]
