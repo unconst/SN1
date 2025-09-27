@@ -5,7 +5,8 @@ from argparse import Namespace
 from pydantic import BaseModel
 from typing import Any, Optional, Callable
 from fastapi import FastAPI, Request, HTTPException, Depends
-import os, sys, time, uuid, json, asyncio, logging, shutil, subprocess, shlex, secrets, threading, importlib, importlib.util
+from fastapi.concurrency import run_in_threadpool
+import os, sys, time, uuid, json, asyncio, logging, shutil, subprocess, shlex, secrets, threading, importlib, importlib.util, inspect
 
 # Library logging: expose a named logger without configuring handlers/levels.
 logger = logging.getLogger("sn1")
@@ -19,7 +20,7 @@ def _base_url(base_url: Optional[str] = None) -> str:
         return env.rstrip("/")
     try:
         if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
-            return "http://host.docker.internal:5005"
+            return "http://127.0.0.1:5005"
     except Exception:
         pass
     return "http://127.0.0.1:5005"
@@ -58,8 +59,17 @@ tools = _ToolsProxy()
 def tool(_fn: Callable | None = None, *, name: str | None = None):
     return declare_tool(_fn, name=name)
 
-# Re-export the entrypoint decorator for agent scripts
-from .boot import entrypoint as entrypoint
+# Re-export the entrypoint decorator for agent scripts, but also register to RPC
+from . import boot as _boot
+def entrypoint(_fn: Callable | None = None, *, name: str | None = None):
+    def _decorator(fn: Callable) -> Callable:
+        # Register entrypoints under a dedicated namespace to avoid colliding with tools
+        ep_name = f"entry:{name or fn.__name__}"
+        register(ep_name, fn)
+        return _boot.entrypoint(name=name)(fn)
+    if _fn is None:
+        return _decorator
+    return _decorator(_fn)
 
 # ---------------- Env loader ----------------
 def load_env(env_or_path: str) -> Namespace:
@@ -87,7 +97,7 @@ def load_env(env_or_path: str) -> Namespace:
         tools_module.register_tools()
 
     allowed_methods = set(getattr(tools_module, "ALLOWED_METHODS", set()))
-    docker_image = getattr(tools_module, "DOCKER_IMAGE", "thebes1618/sn1:latest")
+    docker_image = getattr(tools_module, "DOCKER_IMAGE", "python:3.11-slim")
     entrypoint = getattr(tools_module, "ENTRYPOINT", "solve")
     defaults = getattr(tools_module, "TOOL_DEFAULTS", None)
 
@@ -152,6 +162,10 @@ app = FastAPI()
 async def healthz():
     return {"ok": True}
 
+@app.get("/methods")
+async def methods():
+    return {"methods": sorted(_METHODS.keys())}
+
 @app.post("/rpc")
 async def rpc_call(payload: RpcIn, tok: str = Depends(_validate_token)):
     fn = _METHODS.get(payload.method)
@@ -163,11 +177,13 @@ async def rpc_call(payload: RpcIn, tok: str = Depends(_validate_token)):
         raise HTTPException(status_code=403, detail=f"method {payload.method} not allowed for this token")
     async with _GLOBAL_LIMIT, meta["sem"]:
         try:
-            res = fn(*payload.args, **payload.kwargs)
-            if asyncio.iscoroutine(res):
-                res = await res
+            if inspect.iscoroutinefunction(fn):
+                res = await fn(*payload.args, **payload.kwargs)
+            else:
+                res = await run_in_threadpool(fn, *payload.args, **payload.kwargs)
             return {"ok": True, "result": res}
         except Exception as e:
+            logger.error(f"rpc error in {payload.method}: {e}")
             return {"ok": False, "error": str(e)}
 
 _SERVER_BOOT_LOCK = threading.Lock()
@@ -198,6 +214,63 @@ def ensure_server_running(*, host: str = "0.0.0.0", port: int = 5005, startup_ti
             return
         time.sleep(0.1)
     raise RuntimeError("Failed to start local SN1 server")
+
+# --- Auto-load tools/entrypoints when running in a container ---
+def _load_module_from_file(name: str, file_path: Path):
+    spec = importlib.util.spec_from_file_location(name, str(file_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed loading module from {file_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+def _autoregister_from_env() -> None:
+    try:
+        # Support both module names and file paths via env vars
+        mods = (os.getenv("SN1_IMPORT_MODULES") or "").strip()
+        paths = (os.getenv("SN1_IMPORT_PATHS") or "").strip()
+        if mods:
+            for m in [x.strip() for x in mods.split(",") if x.strip()]:
+                importlib.import_module(m)
+                logger.info(f"sn1: imported module {m}")
+        if paths:
+            for i, p in enumerate([x.strip() for x in paths.split(":" ) if x.strip()]):
+                _p = Path(p)
+                if _p.exists():
+                    _load_module_from_file(f"sn1_autoload_{i}_{_p.stem}", _p)
+                    logger.info(f"sn1: loaded file {_p}")
+        # Fallback to common /app layout
+        if not mods and not paths:
+            for candidate in ["/app/tools.py", "/app/agent.py"]:
+                if os.path.exists(candidate):
+                    _load_module_from_file(f"sn1_autoload_{Path(candidate).stem}", Path(candidate))
+                    logger.info(f"sn1: loaded file {candidate}")
+    except Exception as e:
+        logger.warning(f"autoregister failed: {e}")
+
+def _bootstrap_container_token() -> None:
+    fixed = os.getenv("SN1_TOKEN")
+    if fixed and fixed not in _TOKEN_META:
+        # Accept this token for all methods with a long expiry
+        _TOKEN_META[fixed] = {
+            "expiry": time.time() + 365 * 24 * 3600,
+            "allowed": set(),
+            "sem": asyncio.Semaphore(64),
+        }
+        logger.info("sn1: accepted container SN1_TOKEN for RPC")
+
+@app.on_event("startup")
+async def _on_startup():
+    _bootstrap_container_token()
+    _autoregister_from_env()
+    logger.info(f"sn1: startup complete; registered {len(_METHODS)} methods")
+
+# Always register a builtin lister
+def _list_methods() -> list[str]:
+    return sorted(list(_METHODS.keys()))
+
+register("__list__", _list_methods)
 
 # ---------------- Docker helpers and Container ----------------
 def _get_docker_bin() -> str:
@@ -244,10 +317,45 @@ def exec_in_container(container_id: str, command: str) -> tuple[int, str, str]:
     proc = _docker("exec", container_id, "/bin/sh", "-lc", command, capture_output=True, check=False)
     return proc.returncode, proc.stdout, proc.stderr
 
+def exec_in_container_detach(container_id: str, command: str) -> None:
+    _docker("exec", "-d", container_id, "/bin/sh", "-lc", command, capture_output=True, check=False)
+
 def stop_and_remove_container(container_id: str):
     _docker("rm", "-f", container_id, check=False)
 
  
+def _container_host_port(container_id: str, internal_port: int = 5005) -> int:
+    try:
+        out = _docker("port", container_id, f"{internal_port}/tcp").stdout.strip()
+        # Expected formats like: "0.0.0.0:49153" or ":::49153". Take the last colon segment.
+        if out:
+            last = out.split()[-1]
+            port = int(last.split(":")[-1])
+            return port
+    except Exception as e:
+        logger.warning(f"failed to discover published port: {e}")
+    raise RuntimeError("could not determine published host port")
+
+def run_detached_container(image: str, name: str, env: dict[str, str] | None = None, extra_args: list[str] | None = None) -> str:
+    env = env or {}
+    extra_args = extra_args or []
+    try:
+        _docker("pull", image)
+    except Exception as e:
+        logger.warning(f"docker pull failed (continuing): {e}")
+    args = [
+        "run", "-d", "--name", name,
+        "--add-host=host.docker.internal:host-gateway",
+        "-p", "0:5005",
+    ]
+    for k, v in env.items():
+        args += ["-e", f"{k}={v}"]
+    args += extra_args
+    args += [image]
+    run = _docker(*args)
+    container_id = run.stdout.strip() or name
+    return container_id
+
 class Container:
     def __init__(
         self,
@@ -265,13 +373,14 @@ class Container:
             if allowed_methods is None:
                 allowed_methods = set(getattr(spec, "allowed_methods", set()))
         self.image = image or "thebes1618/sn1:latest"
-        self.local_script_path = os.path.abspath(agent)
-        self.in_container_script_path = f"/app/{os.path.basename(self.local_script_path)}"
+        self.local_script_path = os.path.abspath(agent) if agent else None
+        self.in_container_script_path = f"/app/{os.path.basename(self.local_script_path)}" if self.local_script_path else None
         self.python_path = python_path
         self.container_name = f"sn1-{os.path.splitext(os.path.basename(self.local_script_path))[0]}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
-        self.token = issue_token(ttl_s=token_ttl, allowed_methods=allowed_methods or set())
-        self.base_url = (base_url or "http://host.docker.internal:5005").rstrip("/")
+        # Generate a shared token used by host<->container HTTP
+        self.token = secrets.token_urlsafe(24)
+        self.base_url = (base_url or "").rstrip("/")
 
         # Ensure local server if pointing to host
         try:
@@ -285,20 +394,76 @@ class Container:
             logger.warning(f"ensure_server_running failed: {_e}")
 
         logger.info(f"Preparing container {self.container_name} from {self.image}")
-        self.container_id = create_running_container(
-            self.image,
-            self.container_name,
-            env={"RUNNER_BASE_URL": self.base_url, "SN1_TOKEN": self.token},
-        )
 
-        # Copy user script and our package into the container
-        copy_into_container(self.container_id, self.local_script_path, self.in_container_script_path)
-        pkg_src = os.path.dirname(__file__)
-        copy_into_container(self.container_id, pkg_src, "/app")
+        if self.base_url:
+            # External server; we don't manage a container
+            self.container_id = ""
+        else:
+            if self.local_script_path and os.path.exists(self.local_script_path):
+                # Develop-from-file mode: prepare a container, copy files, and start uvicorn
+                self.container_id = create_running_container(
+                    self.image,
+                    self.container_name,
+                    env={"SN1_TOKEN": self.token},
+                    extra_args=["-p", "0:5005"],
+                )
+                # Ensure working directory exists
+                _ = exec_in_container(self.container_id, "mkdir -p /app")
+                # Copy agent and tools
+                copy_into_container(self.container_id, self.local_script_path, "/app/agent.py")
+                tools_candidate = os.path.join(os.path.dirname(self.local_script_path), "tools.py")
+                if os.path.exists(tools_candidate):
+                    copy_into_container(self.container_id, tools_candidate, "/app/tools.py")
+                # Copy our package into /app so `import sn1` works without pip install
+                pkg_src = os.path.dirname(__file__)
+                copy_into_container(self.container_id, pkg_src, "/app")
+                # Ensure runtime deps exist (venv + fastapi + uvicorn)
+                rc, out, err = exec_in_container(
+                    self.container_id,
+                    "python -m venv /opt/venv || true; "
+                    "if ! /opt/venv/bin/python -c 'import uvicorn,fastapi,requests' 2>/dev/null; then "
+                    "/opt/venv/bin/pip install --no-cache-dir --upgrade pip && "
+                    "/opt/venv/bin/pip install --no-cache-dir fastapi uvicorn requests; fi",
+                )
+                if rc != 0:
+                    tail = (err or "").strip().splitlines()[-10:]
+                    snippet = ("\n".join(tail)).strip()
+                    raise RuntimeError(f"Container dependency install failed:\n{snippet}")
+                # Start server in background
+                exec_in_container_detach(
+                    self.container_id,
+                    "cd /app && SN1_IMPORT_PATHS=/app/tools.py:/app/agent.py /opt/venv/bin/python -m uvicorn sn1:app --host 0.0.0.0 --port 5005",
+                )
+            else:
+                # Image-only mode: assume image starts uvicorn sn1:app
+                self.container_id = run_detached_container(
+                    self.image,
+                    self.container_name,
+                    env={"SN1_TOKEN": self.token},
+                )
 
-        # Copy embedded bootstrapper module file
-        boot_src = os.path.join(pkg_src, "boot.py")
-        copy_into_container(self.container_id, boot_src, "/app/boot.py")
+            # Discover mapped host port and set base_url
+            host_port = _container_host_port(self.container_id, 5005)
+            self.base_url = f"http://127.0.0.1:{host_port}"
+            logger.info(f"sn1: container {self.container_id[:12]} listening at {self.base_url}")
+
+            # Wait for health before proceeding
+            deadline = time.time() + 120.0
+            while time.time() < deadline:
+                try:
+                    r = requests.get(f"{self.base_url}/healthz", timeout=0.5)
+                    if r.ok:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.2)
+            else:
+                try:
+                    r = requests.get(f"{self.base_url}/methods", timeout=0.5)
+                    logger.warning(f"sn1: /methods before fail -> {getattr(r,'text',None)}")
+                except Exception as e:
+                    logger.warning(f"sn1: /methods request failed: {e}")
+                raise RuntimeError("Agent HTTP server did not become ready in time")
 
         self._destroyed = False
 
@@ -308,43 +473,16 @@ class Container:
 
     def _call(self, entry: str, *args, **kwargs):
         self._ensure_active()
-        payload = {"args": list(args), "kwargs": kwargs}
-        payload_json = json.dumps(payload, separators=(",", ":"))
-        cmd_parts = [
-            shlex.quote(self.python_path),
-            "/app/boot.py",
-            "--script", shlex.quote(self.in_container_script_path),
-            "--entry", shlex.quote(entry),
-            "--payload", shlex.quote(payload_json),
-        ]
-        cmd = " ".join(cmd_parts)
-        rc, out, err = exec_in_container(self.container_id, cmd)
-        if err:
-            for line in err.splitlines():
-                logger.warning(f"[script][stderr] {line}")
-        parsed = None
-        if out and out.strip():
-            try:
-                parsed = json.loads(out.strip())
-            except json.JSONDecodeError:
-                parsed = None
-        if isinstance(parsed, dict) and parsed.get("ok") is False:
-            message = parsed.get("error", "remote error")
-            err_type = parsed.get("type")
-            if err_type:
-                message = f"{err_type}: {message}"
-            raise RuntimeError(message)
-        if rc != 0:
-            tail = (err or "").strip().splitlines()[-5:]
-            snippet = ("\n".join(tail)).strip()
-            if snippet:
-                raise RuntimeError(f"script exited with code {rc}:\n{snippet}")
-            raise RuntimeError(f"script exited with code {rc}")
-        if isinstance(parsed, dict) and "result" in parsed:
-            return parsed["result"]
-        if parsed is not None:
-            return parsed
-        return out
+        prev = os.environ.get("SN1_TOKEN")
+        os.environ["SN1_TOKEN"] = self.token
+        try:
+            method = f"entry:{entry}"
+            return rpc(method, *args, base_url=self.base_url, **kwargs)
+        finally:
+            if prev is None:
+                os.environ.pop("SN1_TOKEN", None)
+            else:
+                os.environ["SN1_TOKEN"] = prev
 
     def __getattr__(self, name: str):
         def _caller(*args, **kwargs):
