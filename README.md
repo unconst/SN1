@@ -6,7 +6,8 @@ A template for open source agent incentives on a Bittensor subnet.
 ```python
 import sn1
 @sn1.tool
-async def multiply(x:float, y:float) -> float:
+async def multiply(ctx: sn1.Context, x: float, y: float) -> float:
+    # ctx.token is the caller token; carry any per-call metadata here
     return x * y
 ```
 
@@ -14,8 +15,8 @@ async def multiply(x:float, y:float) -> float:
 ```python
 import sn1
 @sn1.entrypoint
-def multiply(x:float, y:float) -> float:
-    return sn1.tools.multiply(x = x, y = y)
+def multiply(x: float, y: float) -> float:
+    return sn1.tools.multiply(x=x, y=y)
 ```
 
 ### Run Agent

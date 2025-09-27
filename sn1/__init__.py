@@ -3,6 +3,7 @@ import requests
 from pathlib import Path
 from argparse import Namespace
 from pydantic import BaseModel
+from dataclasses import dataclass, field
 from typing import Any, Optional, Callable
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.concurrency import run_in_threadpool
@@ -118,6 +119,15 @@ _METHODS: dict[str, Any] = {}
 _TOKEN_META: dict[str, dict[str, Any]] = {}
 _GLOBAL_LIMIT = asyncio.Semaphore(200)
 
+@dataclass
+class Context:
+    token: str
+    method: str
+    request_id: str
+    created_at: float
+    headers: dict[str, str] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
+
 def register(name: str, fn: Any) -> None:
     _METHODS[name] = fn
 
@@ -170,8 +180,27 @@ async def healthz():
 async def methods():
     return {"methods": sorted(_METHODS.keys())}
 
+def _fn_wants_ctx(fn: Callable) -> bool:
+    try:
+        sig = inspect.signature(fn)
+        params = list(sig.parameters.values())
+        if not params:
+            return False
+        p0 = params[0]
+        if p0.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            return False
+        anno = p0.annotation
+        if isinstance(anno, type):
+            anno_name = getattr(anno, "__name__", "")
+        else:
+            anno_name = str(anno)
+        wants = (p0.name in {"ctx", "_ctx", "context"}) or (anno_name.lower() == "context" or "sn1.Context" in anno_name)
+        return wants
+    except Exception:
+        return False
+
 @app.post("/rpc")
-async def rpc_call(payload: RpcIn, tok: str = Depends(_validate_token)):
+async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_token)):
     fn = _METHODS.get(payload.method)
     if not fn:
         raise HTTPException(status_code=404, detail=f"unknown method {payload.method}")
@@ -181,10 +210,24 @@ async def rpc_call(payload: RpcIn, tok: str = Depends(_validate_token)):
         raise HTTPException(status_code=403, detail=f"method {payload.method} not allowed for this token")
     async with _GLOBAL_LIMIT, meta["sem"]:
         try:
+            ctx = Context(
+                token=tok,
+                method=payload.method,
+                request_id=uuid.uuid4().hex,
+                created_at=time.time(),
+                headers={k: v for k, v in req.headers.items()},
+            )
+            wants_ctx = _fn_wants_ctx(fn)
             if inspect.iscoroutinefunction(fn):
-                res = await fn(*payload.args, **payload.kwargs)
+                if wants_ctx:
+                    res = await fn(ctx, *payload.args, **payload.kwargs)
+                else:
+                    res = await fn(*payload.args, **payload.kwargs)
             else:
-                res = await run_in_threadpool(fn, *payload.args, **payload.kwargs)
+                if wants_ctx:
+                    res = await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
+                else:
+                    res = await run_in_threadpool(fn, *payload.args, **payload.kwargs)
             return {"ok": True, "result": res}
         except Exception as e:
             logger.error(f"rpc error in {payload.method}: {e}")
