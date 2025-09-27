@@ -6,7 +6,8 @@ def main():
     spec = sn1.load_env(os.path.dirname(__file__))
     agent = os.path.join(os.path.dirname(__file__), "agent.py")
     with sn1.Container(agent = agent, spec = spec, ctx={'foo': 'bar', 'n_tool_calls': 0}) as s:
-        print(s.multiply(x = 2, y = 5, timeout = 1))
+        for i in range(10):
+            print( f'{i} * {i^2} =', s.multiply(x = i, y = i^2, timeout = 1) )
         print("calls:", s.ctx.get("tool_calls", 0))
 
 if __name__ == "__main__":
