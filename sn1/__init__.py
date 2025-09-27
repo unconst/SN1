@@ -72,11 +72,20 @@ class _ToolsProxy:
                         loop = None
                     if loop is None:
                         if wants_ctx:
-                            return asyncio.run(fn(active_ctx, *args, **kwargs))
+                            # Tools are trusted writers; temporarily enable writes
+                            active_ctx._trusted_writer = True
+                            try:
+                                return asyncio.run(fn(active_ctx, *args, **kwargs))
+                            finally:
+                                active_ctx._trusted_writer = False
                         return asyncio.run(fn(*args, **kwargs))
                     # Running inside an event loop; fall back to HTTP path
                 if wants_ctx:
-                    return fn(active_ctx, *args, **kwargs)
+                    active_ctx._trusted_writer = True
+                    try:
+                        return fn(active_ctx, *args, **kwargs)
+                    finally:
+                        active_ctx._trusted_writer = False
                 return fn(*args, **kwargs)
             if len(args) == 1 and "prompt" not in kwargs:
                 kwargs["prompt"] = args[0]
@@ -175,25 +184,14 @@ class Context:
     created_at: float
     headers: dict[str, str] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
-
-    def __getattr__(self, name: str) -> Any:
-        try:
-            return self.meta[name]
-        except KeyError as e:
-            raise AttributeError(f"Context has no attribute '{name}'") from e
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        # Route unknown attributes into the meta dictionary so that code can do ctx.tokens += n
-        if name in {"token", "method", "request_id", "created_at", "headers", "meta"}:
-            return super().__setattr__(name, value)
-        try:
-            meta = object.__getattribute__(self, "meta")
-            if isinstance(meta, dict):
-                meta[name] = value
-                return
-        except Exception:
-            pass
-        return super().__setattr__(name, value)
+    _trusted_writer: bool = False
+    def get(self, key: str, default: Any = None) -> Any:
+        try: return self.meta.get(key, default)
+        except Exception: return default
+    def set(self, key: str, value: Any) -> None:
+        try: 
+            if self._trusted_writer: self.meta[key] = value
+        except Exception:pass
 
 def register(name: str, fn: Any) -> None:
     _METHODS[name] = fn
@@ -281,11 +279,19 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
                 async def _invoke():
                     if inspect.iscoroutinefunction(fn):
                         if wants_ctx:
-                            return await fn(ctx, *payload.args, **payload.kwargs)
+                            ctx._trusted_writer = True
+                            try:
+                                return await fn(ctx, *payload.args, **payload.kwargs)
+                            finally:
+                                ctx._trusted_writer = False
                         return await fn(*payload.args, **payload.kwargs)
                     else:
                         if wants_ctx:
-                            return await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
+                            ctx._trusted_writer = True
+                            try:
+                                return await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
+                            finally:
+                                ctx._trusted_writer = False
                         return await run_in_threadpool(fn, *payload.args, **payload.kwargs)
                 if exec_timeout and exec_timeout > 0:
                     res = await asyncio.wait_for(_invoke(), timeout=exec_timeout)
@@ -539,12 +545,17 @@ class Container:
         # Generate a shared token used by host<->container HTTP
         self.token = secrets.token_urlsafe(24)
         self.base_url = (base_url or "").rstrip("/")
-        # User-provided call context (exposed locally and sent with RPC requests)
-        self._ctx_source = ctx or {}
-        try:
-            self.ctx = types.SimpleNamespace(**(self._ctx_source if isinstance(self._ctx_source, dict) else {"value": self._ctx_source}))
-        except Exception:
-            self.ctx = types.SimpleNamespace()
+        # Runner-visible context holder; use explicit get/set
+        self._runner_ctx: dict[str, Any] = dict(ctx or {})
+        self.ctx = Context(
+            token=self.token,
+            method="runner",
+            request_id=uuid.uuid4().hex,
+            created_at=time.time(),
+            headers={},
+            meta=dict(self._runner_ctx),
+            _trusted_writer=True,
+        )
 
         # Ensure local server if pointing to host
         try:
@@ -639,13 +650,9 @@ class Container:
 
     def _ctx_payload(self) -> dict[str, Any]:
         try:
-            if isinstance(self._ctx_source, dict):
-                return dict(self._ctx_source)
-            if hasattr(self.ctx, "__dict__"):
-                return dict(self.ctx.__dict__)
+            return dict(self.ctx.meta)
         except Exception:
-            pass
-        return {}
+            return {}
 
     def _call(self, entry: str, *args, **kwargs):
         self._ensure_active()
@@ -678,11 +685,10 @@ class Container:
             try:
                 returned_ctx = data.get("ctx")
                 if isinstance(returned_ctx, dict):
-                    for k, v in returned_ctx.items():
-                        try:
-                            setattr(self.ctx, k, v)
-                        except Exception:
-                            pass
+                    try:
+                        self.ctx.meta.update(returned_ctx)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             if data.get("ok") is True:
@@ -698,28 +704,9 @@ class Container:
                 os.environ["SN1_TOKEN"] = prev
 
     def __getattr__(self, name: str):
-        # First, expose context fields directly on the container (e.g., s.tokens)
-        try:
-            ctx = object.__getattribute__(self, "ctx")
-            if hasattr(ctx, name):
-                return getattr(ctx, name)
-        except Exception:
-            pass
         def _caller(*args, **kwargs):
             return self._call(name, *args, **kwargs)
         return _caller
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        # Route unknown attribute sets to the context so code can do s.tokens = ...
-        reserved = {"image", "local_script_path", "in_container_script_path", "python_path", "container_name", "token", "base_url", "_ctx_source", "ctx", "container_id", "_destroyed"}
-        if name in reserved or name.startswith("_"):
-            return super().__setattr__(name, value)
-        try:
-            ctx = object.__getattribute__(self, "ctx")
-            setattr(ctx, name, value)
-            return
-        except Exception:
-            return super().__setattr__(name, value)
 
     def entries(self) -> list[str]:
         try:
