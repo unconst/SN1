@@ -7,6 +7,7 @@ notebooks
 notebooks/*
 modelpath/
 
+.env
 agents/*
 !agents/base_agent.py
 

@@ -52,11 +52,15 @@ def exec_in_container(container_id: str, command: str) -> tuple[int, str, str]:
     proc = _docker("exec", container_id, "/bin/sh", "-lc", command, capture_output=True, check=False)
     return proc.returncode, proc.stdout, proc.stderr
 
-def stop_and_remove_container(container_id: str):
-    try:
-        _docker("stop", container_id, check=False)
-    finally:
-        _docker("rm", container_id, check=False)
+def stop_and_remove_container(container_id: str, timeout_s: int = 1):
+    """
+    Remove a container quickly.
+
+    Docker Desktop on macOS can take a long time to gracefully stop containers
+    (default ~10s). Prefer a forceful remove to keep shutdown snappy.
+    """
+    # Fast path: forcibly remove (also stops if running)
+    _docker("rm", "-f", container_id, check=False)
 
 # ---------------- Container API ----------------
 class Container:
