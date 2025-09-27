@@ -11,22 +11,26 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 
 # ---------------- Registry & Tokens ----------------
 _METHODS: Dict[str, Callable[..., Any]] = {}
-_TOKENS: Dict[str, float] = {}  # token -> expiry (epoch seconds)
-_PER_TOKEN_LIMIT: Dict[str, asyncio.Semaphore] = {}
+# tok -> {"expiry": float, "allowed": set[str], "sem": asyncio.Semaphore}
+_TOKEN_META: Dict[str, dict] = {}
 _GLOBAL_LIMIT = asyncio.Semaphore(200)  # global backpressure, tune as needed
 
 def register(name: str, fn: Callable[..., Any]):
     _METHODS[name] = fn
 
-def issue_token(ttl_s: int = 3600, per_token_limit: int = 16) -> str:
+def issue_token(ttl_s: int = 3600, per_token_limit: int = 16, allowed_methods: set[str] | None = None) -> str:
     tok = secrets.token_urlsafe(24)
-    _TOKENS[tok] = time.time() + ttl_s
-    _PER_TOKEN_LIMIT[tok] = asyncio.Semaphore(per_token_limit)
+    _TOKEN_META[tok] = {
+        "expiry": time.time() + ttl_s,
+        "allowed": set(allowed_methods or []),
+        "sem": asyncio.Semaphore(per_token_limit),
+    }
     return tok
 
 def validate_token(req: Request) -> str:
     tok = req.headers.get("x-sn1-token")
-    if not tok or tok not in _TOKENS or _TOKENS[tok] < time.time():
+    meta = _TOKEN_META.get(tok)
+    if not tok or not meta or meta["expiry"] < time.time():
         raise HTTPException(status_code=401, detail="invalid or expired token")
     return tok
 
@@ -46,7 +50,11 @@ async def rpc_call(payload: RpcIn, tok: str = Depends(validate_token)):
     fn = _METHODS.get(payload.method)
     if not fn:
         raise HTTPException(status_code=404, detail=f"unknown method {payload.method}")
-    async with _GLOBAL_LIMIT, _PER_TOKEN_LIMIT[tok]:
+    meta = _TOKEN_META[tok]
+    allowed = meta["allowed"]
+    if allowed and payload.method not in allowed:
+        raise HTTPException(status_code=403, detail=f"method {payload.method} not allowed for this token")
+    async with _GLOBAL_LIMIT, meta["sem"]:
         try:
             res = fn(*payload.args, **payload.kwargs)
             if asyncio.iscoroutine(res):

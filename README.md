@@ -5,10 +5,8 @@ A template for open source agent incentives on a Bittensor subnet.
 # Features
 - Agents which pull/push from public Github Gists
 - Run agents in secure sandboxes (docker containers)
-- Provide agents with white listed tools which port back to the host (i.e. 'sn1.tools.llm' a chutes endpoint)
+- Provide agents with env-local tools via RPC (`sn1.tools.<name>` or `sn1.tool("name")`) enforced by per-token allowlists
 - Docker orchestration with watchtower allows you to make direct commitments to running validators
-
-  
 
 ## Build Agent
 ```python
@@ -20,15 +18,11 @@ from sn1.boot import entrypoint
 def anything( z:str, y: int = 1 ) -> str:
     return y * z
 
-# Call a function from tools
+# Query an llm through the tools (two equivalent styles)
 @entrypoint()
-def in_func( x: int = 1 ):
-    return sn1.tools.out_func(x=x)
-
-# Query an llm through the tools.
-@entrypoint()
-def llm( prompt:str ):
-    return sn1.tools.llm( prompt = prompt )
+def llm(prompt: str):
+    return sn1.tools.llm(prompt=prompt)
+    # or: return sn1.tool("llm", prompt=prompt)
 ```
 
 ## Run an Agent
@@ -36,8 +30,18 @@ def llm( prompt:str ):
 from sn1 import Container
 with Container("gen.py") as s:
     print(s.anything( z = 'cat', y = 2))   # -> catcat
-    print(s.in_func( 2 ))   # -> 5  (direct function inside container)
-    print(s.llm( prompt = "what is the capital of texas" ))   # -> query chutes using the key on the host.
+    print(s.llm(prompt="what is the capital of texas"))   # -> queries host via allowlisted tool
+
+```
+
+## Environments and Tools
+
+All tools are defined per-environment in `environments/<env>/tools.py`. The host issues a token with an allowlist derived from that file and enforces it at `/rpc`.
+
+Run an environment against an agent:
+
+```bash
+sn1 env run math_mul --agent gen.py --samples 20
 ```
 
 ## (TODO) Validating

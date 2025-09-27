@@ -13,10 +13,12 @@ import logging
 import tempfile
 import aiofiles
 import traceback
+import requests
 import bittensor as bt 
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import Any
+from argparse import Namespace
 load_dotenv(override=True)
 
 NETUID = 1
@@ -65,34 +67,6 @@ async def get_subtensor():
             os._exit(1)
     return SUBTENSOR
 
-# ---------------- CHUTES ----------------
-TERMINAL = {400, 404, 410}
-async def CHUTES(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=150, retries=0, backoff=1) -> str | None:
-    url = f"https://{slug}.chutes.ai/v1/chat/completions"
-    hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
-    if aiohttp is None:
-        return None
-    client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
-    sem = asyncio.Semaphore(int(os.getenv("SN1_HTTP_CONCURRENCY", "16")))
-    for attempt in range(1, retries + 2):
-        try:
-            payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
-            async with sem, client.post(url, json=payload, headers=hdr, timeout=timeout) as r:
-                txt = await r.text(errors="ignore")
-                if r.status in TERMINAL:
-                    return None
-                r.raise_for_status()
-                content = (await r.json())["choices"][0]["message"]["content"]
-                return content
-        except Exception:
-            if attempt > retries:
-                return None
-            await asyncio.sleep(backoff * 2 ** (attempt - 1) * (1 + random.uniform(-0.1, 0.1)))
-            
-async def SEARCH(query: str) -> str:
-    return "results from sn13"
-
-# ---------------- Tools ----------------
 from .docker import *
     
 # -------------- Host communication helpers --------------
@@ -123,27 +97,19 @@ def rpc(method: str, *args, base_url: Optional[str] = None, timeout: int = 60, *
         return data.get("result")
     raise RuntimeError((isinstance(data, dict) and data.get("error")) or "remote error")
 
-def func(*, x: int = 1) -> int:
-    return x + 1
+class _ToolsProxy:
+    """Generic dynamic bridge. Any attribute becomes an RPC call."""
+    def __getattr__(self, method: str):
+        def _call(*, base_url: str | None = None, timeout: int = 60, **kwargs):
+            return rpc(method, base_url=base_url, timeout=timeout, **kwargs)
+        return _call
 
-async def llm_tool(*, prompt: str, model: str = "unsloth/gemma-3-12b-it", timeout: int = 150):
-    return await CHUTES(prompt, model=model, timeout=timeout)
+# Public, importable API for agents:
+tools = _ToolsProxy()
 
-class tools:
-    @staticmethod
-    def func(*, x: int = 1, base_url: Optional[str] = None, timeout: int = 60):
-        return rpc("out_func", x=x, base_url=base_url, timeout=timeout)
-    
-    @staticmethod
-    def llm(*, prompt: str, model: str = "unsloth/gemma-3-12b-it", base_url: Optional[str] = None, timeout: int = 60):
-        return rpc("llm", prompt=prompt, model=model, base_url=base_url, timeout=timeout)
-    
-# Register tools.
-def _register_default_methods() -> None:
-    from .server import register
-    register("func", func)
-    register("llm", llm_tool)
-_register_default_methods()
+def tool(name: str, /, **kwargs):
+    """Simple one-function style: sn1.tool('llm', prompt='...')."""
+    return getattr(tools, name)(**kwargs)
 
 # ---------------- Get Agent. ----------------
 async def pull_agent(uid: int) -> str:
@@ -185,6 +151,47 @@ async def pull_agent(uid: int) -> str:
 @click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
 def cli(verbose):
     setup_logging(verbose)
+
+def load_env(env_or_path: str) -> Namespace:
+    import importlib, importlib.util, sys
+
+    p = Path(env_or_path)
+    if p.exists():
+        base_dir = p if p.is_dir() else p.parent
+        tools_file = base_dir / "tools.py"
+        if not tools_file.exists():
+            raise RuntimeError(f"Invalid environment path: {base_dir}. Expected tools.py")
+
+        def _load_module_from_file(name: str, file_path: Path):
+            spec = importlib.util.spec_from_file_location(name, str(file_path))
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"Failed loading module from {file_path}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+            return module
+
+        tools_module = _load_module_from_file(f"sn1_env_{uuid.uuid4().hex}_tools", tools_file)
+    else:
+        tools_module = importlib.import_module(f"environments.{env_or_path}.tools")
+
+    if hasattr(tools_module, "register_tools"):
+        tools_module.register_tools()
+
+    allowed_methods = set(getattr(tools_module, "ALLOWED_METHODS", set()))
+    docker_image = getattr(tools_module, "DOCKER_IMAGE", "thebes1618/sn1:latest")
+    entrypoint = getattr(tools_module, "ENTRYPOINT", "solve")
+    defaults = getattr(tools_module, "TOOL_DEFAULTS", None)
+
+    return Namespace(
+        docker_image=docker_image,
+        entrypoint=entrypoint,
+        allowed_methods=allowed_methods,
+        defaults=defaults,
+    )
+
+
+ 
 
 # ---------------- Watchdog ----------------
 HEARTBEAT = time.monotonic()

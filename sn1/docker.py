@@ -72,13 +72,20 @@ class Container:
     def __init__(
         self,
         path_to_script: str,
-        image: str = "thebes1618/sn1:latest",
+        image: str | None = None,
         *,
+        spec: Any | None = None,
         python_path: str = "/opt/venv/bin/python",
         base_url: Optional[str] = None,
-        token_ttl: int = 3600
+        token_ttl: int = 3600,
+        allowed_methods: set[str] | None = None,
     ) -> None:
-        self.image = image
+        # Prefer spec if provided; fallback to explicit args for backward compatibility
+        if spec is not None:
+            image = getattr(spec, "docker_image", image)
+            if allowed_methods is None:
+                allowed_methods = set(getattr(spec, "allowed_methods", set()))
+        self.image = image or "thebes1618/sn1:latest"
         self.local_script_path = os.path.abspath(path_to_script)
         self.in_container_script_path = f"/app/{os.path.basename(self.local_script_path)}"
         self.python_path = python_path
@@ -86,7 +93,7 @@ class Container:
 
         # per-container token and base URL
         from sn1.server import issue_token, ensure_server_running  # local import to avoid cycles
-        self.token = issue_token(ttl_s=token_ttl)
+        self.token = issue_token(ttl_s=token_ttl, allowed_methods=allowed_methods or set())
         # For processes running inside the container, 127.0.0.1 is the container itself.
         # Default to host.docker.internal so the container can reach the host services.
         self.base_url = (base_url or "http://host.docker.internal:5005").rstrip("/")
