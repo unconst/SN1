@@ -100,8 +100,15 @@ def rpc(method: str, *args, base_url: Optional[str] = None, timeout: int = 60, *
 class _ToolsProxy:
     """Generic dynamic bridge. Any attribute becomes an RPC call."""
     def __getattr__(self, method: str):
-        def _call(*, base_url: str | None = None, timeout: int = 60, **kwargs):
-            return rpc(method, base_url=base_url, timeout=timeout, **kwargs)
+        def _call(*args, **kwargs):
+            # Support convenient positional usage: tools.xyz("prompt text")
+            base_url = kwargs.pop("base_url", None)
+            call_timeout = kwargs.pop("timeout", 60)
+            if len(args) == 1 and "prompt" not in kwargs:
+                # Map single positional argument to keyword-only 'prompt'
+                kwargs["prompt"] = args[0]
+                args = ()
+            return rpc(method, *args, base_url=base_url, timeout=call_timeout, **kwargs)
         return _call
 
 # Public, importable API for agents:

@@ -121,8 +121,9 @@ class Container:
         # Copy user script and our package/bootstrapper into the container
         copy_into_container(self.container_id, self.local_script_path, self.in_container_script_path)
         # Copy sn1 package into /app so `import sn1` resolves to our current code
+        # Copy the directory to /app (not /app/sn1) to avoid nesting /app/sn1/sn1
         pkg_src = os.path.dirname(__file__)
-        copy_into_container(self.container_id, pkg_src, "/app/sn1")
+        copy_into_container(self.container_id, pkg_src, "/app")
         # Also copy boot.py explicitly to a well-known path
         boot_src = os.path.join(pkg_src, "boot.py")
         copy_into_container(self.container_id, boot_src, "/app/boot.py")
