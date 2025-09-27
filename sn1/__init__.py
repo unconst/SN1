@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Callable
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.concurrency import run_in_threadpool
-import os, sys, time, uuid, json, asyncio, logging, shutil, subprocess, shlex, secrets, threading, importlib, importlib.util, inspect, types, io, contextlib
+import os, sys, time, uuid, asyncio, logging, shutil, subprocess, secrets, threading, importlib, importlib.util, inspect, types, io, contextlib
 
 # Library logging: expose a named logger without configuring handlers/levels.
 logger = logging.getLogger("sn1")
@@ -19,11 +19,6 @@ def _base_url(base_url: Optional[str] = None) -> str:
     env = os.getenv("RUNNER_BASE_URL")
     if env:
         return env.rstrip("/")
-    try:
-        if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
-            return "http://127.0.0.1:5005"
-    except Exception:
-        pass
     return "http://127.0.0.1:5005"
 
 def call_host(path: str, payload: dict, *, base_url: Optional[str] = None, timeout: int = 60):
@@ -94,16 +89,6 @@ def load_env(env_or_path: str) -> Namespace:
         tools_file = base_dir / "tools.py"
         if not tools_file.exists():
             raise RuntimeError(f"Invalid environment path: {base_dir}. Expected tools.py")
-
-        def _load_module_from_file(name: str, file_path: Path):
-            spec = importlib.util.spec_from_file_location(name, str(file_path))
-            if spec is None or spec.loader is None:
-                raise RuntimeError(f"Failed loading module from {file_path}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
-            spec.loader.exec_module(module)
-            return module
-
         tools_module = _load_module_from_file(f"sn1_env_{uuid.uuid4().hex}_tools", tools_file)
     else:
         tools_module = importlib.import_module(f"environments.{env_or_path}.tools")

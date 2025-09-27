@@ -1,5 +1,4 @@
 import os
-import sys
 import sn1
 
 def main():

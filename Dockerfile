@@ -25,10 +25,6 @@ COPY pyproject.toml uv.lock ./
 RUN uv venv --python python3 $VENV_DIR \
  && uv sync
 
-# Pre install.
-ENV VIRTUAL_ENV=$VENV_DIR
-RUN uv pip install -e .
-
 # 6) Copy your code & install it
 COPY . .
 ENV VIRTUAL_ENV=$VENV_DIR
