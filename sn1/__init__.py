@@ -1,37 +1,25 @@
-# sn1/__init__.py
 from __future__ import annotations
-import os
-import re
-import uuid
-import time
-import click
-import random
-import aiohttp
-import uvicorn
-import asyncio
-import logging
-import tempfile
-import aiofiles
-import traceback
-import requests
-import bittensor as bt 
+import os, sys, time, uuid, json, asyncio, logging, shutil, subprocess, shlex, secrets, threading, importlib, importlib.util
 from pathlib import Path
-from dotenv import load_dotenv
-from typing import Any
+from typing import Any, Optional, Callable
+import requests
+from pydantic import BaseModel
+from fastapi import FastAPI, Request, HTTPException, Depends
 from argparse import Namespace
+from dotenv import load_dotenv
+import click
+
 load_dotenv(override=True)
 
-NETUID = 1
-
-# ---------------- Config ----------------
-def get_conf(key, default=None, except_input: bool = False) -> Any:
+# ---------------- Minimal config ----------------
+def get_conf(key: str, default: Any | None = None, *, prompt_if_missing: bool = False) -> Any:
     v = os.getenv(key)
-    if not v and default is None:
-        if except_input:
+    if (not v) and (default is None):
+        if prompt_if_missing:
             v = input(f"Enter value for {key}: ")
             os.environ[key] = v
             return v
-        raise ValueError(f"{key} not set.\nYou must set env var: {key} in .env")
+        raise ValueError(f"{key} not set. Set it in .env or the environment.")
     return v or default
 
 # ---------------- Logging ----------------
@@ -40,38 +28,21 @@ logging.addLevelName(TRACE, "TRACE")
 def _trace(self, msg, *args, **kwargs):
     if self.isEnabledFor(TRACE):
         self._log(TRACE, msg, args, **kwargs)
-logging.Logger.trace = _trace
+logging.Logger.trace = _trace  # type: ignore[attr-defined]
 logger = logging.getLogger("sn1")
-def setup_logging(verbosity: int):
+def setup_logging(verbosity: int) -> None:
     level = TRACE if verbosity >= 3 else logging.DEBUG if verbosity == 2 else logging.INFO if verbosity == 1 else logging.CRITICAL + 1
-    for noisy in ["websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio", "aiobotocore.regions", "botocore", "uvicorn.access"]:
+    for noisy in [
+        "websockets", "bittensor", "bittensor-cli", "btdecode", "asyncio",
+        "aiobotocore.regions", "botocore", "uvicorn.access",
+    ]:
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.basicConfig(level=level, format="[%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-def info(): setup_logging(1)
-def debug(): setup_logging(2)
-def trace(): setup_logging(3)
 
-# ---------------- Subtensor ----------------
-SUBTENSOR = None
-async def get_subtensor():
-    global SUBTENSOR
-    if SUBTENSOR is None:
-        logger.trace("Making Bittensor connection...")
-        if bt is None:
-            raise RuntimeError("bittensor not installed")
-        SUBTENSOR = bt.async_subtensor(get_conf('SUBTENSOR_ENDPOINT', default='wss://lite.sub.latent.to:443'))
-        try:
-            await SUBTENSOR.initialize()
-            logger.trace("Connected")
-        except Exception as e:
-            os._exit(1)
-    return SUBTENSOR
-
-from .docker import *
-    
-# -------------- Host communication helpers --------------
+# ---------------- Host RPC client ----------------
 def _base_url(base_url: Optional[str] = None) -> str:
-    if base_url: return base_url.rstrip("/")
+    if base_url:
+        return base_url.rstrip("/")
     env = os.getenv("RUNNER_BASE_URL")
     if env:
         return env.rstrip("/")
@@ -98,70 +69,22 @@ def rpc(method: str, *args, base_url: Optional[str] = None, timeout: int = 60, *
     raise RuntimeError((isinstance(data, dict) and data.get("error")) or "remote error")
 
 class _ToolsProxy:
-    """Generic dynamic bridge. Any attribute becomes an RPC call."""
     def __getattr__(self, method: str):
         def _call(*args, **kwargs):
-            # Support convenient positional usage: tools.xyz("prompt text")
             base_url = kwargs.pop("base_url", None)
             call_timeout = kwargs.pop("timeout", 60)
             if len(args) == 1 and "prompt" not in kwargs:
-                # Map single positional argument to keyword-only 'prompt'
                 kwargs["prompt"] = args[0]
                 args = ()
             return rpc(method, *args, base_url=base_url, timeout=call_timeout, **kwargs)
         return _call
 
-# Public, importable API for agents:
 tools = _ToolsProxy()
-
 def tool(name: str, /, **kwargs):
-    """Simple one-function style: sn1.tool('llm', prompt='...')."""
     return getattr(tools, name)(**kwargs)
 
-# ---------------- Get Agent. ----------------
-async def pull_agent(uid: int) -> str:
-    try:
-        logger.info(f"Starting to pull agent for uid: {uid}")
-        sub = await get_subtensor()
-        commit = await sub.get_revealed_commitment(netuid = NETUID, uid = uid)
-        g = commit[0][1]
-        block = commit[0][0]
-        if g.startswith("http") and "api.github.com" not in g:
-            g = f"https://api.github.com/gists/{g.rstrip('/').split('/')[-1]}"
-            logger.debug(f"Converted to gist URL: {g}")
-        if not g.startswith("http"):
-            g = f"https://api.github.com/gists/{g}"
-            logger.debug(f"Added gist prefix: {g}")
-        logger.info(f"Final gist URL: {g}")
-        async with aiohttp.ClientSession() as s:
-            async with s.get(g) as r:
-                data = await r.json()
-            meta = next(iter(data["files"].values()))
-            content = meta.get("content")
-            if content is None or meta.get("truncated"):
-                async with s.get(meta["raw_url"]) as r:
-                    content = await r.text()
-        dir = f"agents/{uid}/{block}/" 
-        Path(dir).mkdir(parents=True, exist_ok=True)
-        name = f"{dir}agent.py"
-        async with aiofiles.open(name, "w", encoding="utf-8") as f:
-            await f.write(content or "")
-        resolved_path = str(Path(name).resolve())
-        logger.info(f"Successfully pulled agent to: {resolved_path}")
-        return resolved_path
-    except Exception as e:
-        logger.warning(f'Failed pulling agent on uid: {uid} with error: {e}')
-        return None
-    
-# ---------------- CLI ----------------
-@click.group()
-@click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
-def cli(verbose):
-    setup_logging(verbose)
-
+# ---------------- Env loader ----------------
 def load_env(env_or_path: str) -> Namespace:
-    import importlib, importlib.util, sys
-
     p = Path(env_or_path)
     if p.exists():
         base_dir = p if p.is_dir() else p.parent
@@ -198,161 +121,309 @@ def load_env(env_or_path: str) -> Namespace:
     )
 
 
+# ---------------- RPC server (FastAPI) ----------------
+_METHODS: dict[str, Any] = {}
+_TOKEN_META: dict[str, dict[str, Any]] = {}
+_GLOBAL_LIMIT = asyncio.Semaphore(200)
+
+def register(name: str, fn: Any) -> None:
+    _METHODS[name] = fn
+
+def declare_tool(_fn: Callable | None = None, *, name: str | None = None):
+    """Decorator to register a function as a callable tool via RPC.
+
+    Usage:
+        @declare_tool
+        def my_tool(...): ...
+
+        or with explicit name:
+        @declare_tool(name="custom")
+        def my_tool(...): ...
+    """
+    def _decorator(fn: Callable) -> Callable:
+        register(name or fn.__name__, fn)
+        return fn
+    if _fn is None:
+        return _decorator
+    return _decorator(_fn)
+
+def issue_token(ttl_s: int = 3600, per_token_limit: int = 16, allowed_methods: set[str] | None = None) -> str:
+    tok = secrets.token_urlsafe(24)
+    _TOKEN_META[tok] = {
+        "expiry": time.time() + ttl_s,
+        "allowed": set(allowed_methods or []),
+        "sem": asyncio.Semaphore(per_token_limit),
+    }
+    return tok
+
+def _validate_token(req: Request) -> str:
+    tok = req.headers.get("x-sn1-token")
+    meta = _TOKEN_META.get(tok)
+    if not tok or not meta or meta["expiry"] < time.time():
+        raise HTTPException(status_code=401, detail="invalid or expired token")
+    return tok
+
+class RpcIn(BaseModel):
+    method: str
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+
+app = FastAPI()
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+@app.post("/rpc")
+async def rpc_call(payload: RpcIn, tok: str = Depends(_validate_token)):
+    fn = _METHODS.get(payload.method)
+    if not fn:
+        raise HTTPException(status_code=404, detail=f"unknown method {payload.method}")
+    meta = _TOKEN_META[tok]
+    allowed = meta["allowed"]
+    if allowed and payload.method not in allowed:
+        raise HTTPException(status_code=403, detail=f"method {payload.method} not allowed for this token")
+    async with _GLOBAL_LIMIT, meta["sem"]:
+        try:
+            res = fn(*payload.args, **payload.kwargs)
+            if asyncio.iscoroutine(res):
+                res = await res
+            return {"ok": True, "result": res}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+_SERVER_BOOT_LOCK = threading.Lock()
+
+def _healthz_local_ok(host: str = "127.0.0.1", port: int = 5005, timeout: float = 0.5) -> bool:
+    try:
+        r = requests.get(f"http://{host}:{port}/healthz", timeout=timeout)
+        return r.ok
+    except Exception:
+        return False
+
+def ensure_server_running(*, host: str = "0.0.0.0", port: int = 5005, startup_timeout_s: float = 10.0) -> None:
+    if _healthz_local_ok(port=port):
+        return
+    with _SERVER_BOOT_LOCK:
+        if _healthz_local_ok(port=port):
+            return
+        def _run_server():
+            import uvicorn
+            config = uvicorn.Config(app, host=host, port=port, log_level="info")
+            server = uvicorn.Server(config)
+            asyncio.run(server.serve())
+        t = threading.Thread(target=_run_server, daemon=True)
+        t.start()
+    deadline = time.time() + startup_timeout_s
+    while time.time() < deadline:
+        if _healthz_local_ok(port=port):
+            return
+        time.sleep(0.1)
+    raise RuntimeError("Failed to start local SN1 server")
+
+# ---------------- Docker helpers and Container ----------------
+def _get_docker_bin() -> str:
+    docker_path = os.getenv("DOCKER_BIN") or "/usr/bin/docker"
+    if os.path.exists(docker_path):
+        return docker_path
+    fallback = shutil.which("docker")
+    if fallback:
+        return fallback
+    raise RuntimeError("docker binary not found. Ensure docker is installed and mounted.")
+
+def _run(cmd: list[str], capture_output: bool = True, check: bool = True) -> subprocess.CompletedProcess:
+    logger.debug(f"Running command: {' '.join(cmd)}")
+    return subprocess.run(cmd, capture_output=capture_output, text=True, check=check)
+
+def _docker(*args: str, capture_output: bool = True, check: bool = True) -> subprocess.CompletedProcess:
+    docker_bin = _get_docker_bin()
+    return _run([docker_bin, *args], capture_output=capture_output, check=check)
+
+def create_running_container(image: str, name: str, env: dict[str, str] | None = None, extra_args: list[str] | None = None) -> str:
+    env = env or {}
+    extra_args = extra_args or []
+    try:
+        _docker("pull", image)
+    except Exception as e:
+        logger.warning(f"docker pull failed (continuing): {e}")
+    args = [
+        "create", "--entrypoint", "/bin/sh", "--name", name,
+        "--add-host=host.docker.internal:host-gateway",
+    ]
+    for k, v in env.items():
+        args += ["-e", f"{k}={v}"]
+    args += extra_args
+    args += [image, "-c", "sleep infinity"]
+    create = _docker(*args)
+    container_id = create.stdout.strip() or name
+    _docker("start", container_id)
+    return container_id
+
+def copy_into_container(container_id: str, src_path: str, dest_path: str):
+    _docker("cp", src_path, f"{container_id}:{dest_path}")
+
+def exec_in_container(container_id: str, command: str) -> tuple[int, str, str]:
+    proc = _docker("exec", container_id, "/bin/sh", "-lc", command, capture_output=True, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+def stop_and_remove_container(container_id: str):
+    _docker("rm", "-f", container_id, check=False)
+
  
 
-# ---------------- Watchdog ----------------
-HEARTBEAT = time.monotonic()
-async def watchdog(timeout: int = 300):
-    global HEARTBEAT
-    while True:
-        await asyncio.sleep(timeout // 3)
-        elapsed = time.monotonic() - HEARTBEAT
-        if elapsed > timeout:
-            logging.error(f"[WATCHDOG] Process stalled {elapsed:.0f}s — exiting process.")
-            os._exit(1)
-    
-    
-@cli.command("push")
-@click.argument("path", default="agents/base_agent.py")
-def push( path:str ):
-    coldkey = get_conf("BT_WALLET_COLD", except_input=True)
-    hotkey = get_conf("BT_WALLET_HOT", except_input=True)
-    github_token = get_conf("GITHUB_TOKEN", except_input=True)
-    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
-    async def main():
-        logger.info('Loading chain state ...')
-        sub = await get_subtensor()
-        metagraph = await sub.metagraph(NETUID)
-        if wallet.hotkey.ss58_address not in metagraph.hotkeys:
-            logger.warning(f"Not registered, first register your wallet `btcli subnet register --netuid {NETUID} --wallet.name {coldkey} --hotkey {hotkey}`")
-            os._exit(1)
-        logger.info(f'UID: {metagraph.hotkeys.index(wallet.hotkey.ss58_address)}')
+class Container:
+    def __init__(
+        self,
+        path_to_script: str,
+        image: str | None = None,
+        *,
+        spec: Any | None = None,
+        python_path: str = "/opt/venv/bin/python",
+        base_url: Optional[str] = None,
+        token_ttl: int = 3600,
+        allowed_methods: set[str] | None = None,
+    ) -> None:
+        if spec is not None:
+            image = getattr(spec, "docker_image", image)
+            if allowed_methods is None:
+                allowed_methods = set(getattr(spec, "allowed_methods", set()))
+        self.image = image or "thebes1618/sn1:latest"
+        self.local_script_path = os.path.abspath(path_to_script)
+        self.in_container_script_path = f"/app/{os.path.basename(self.local_script_path)}"
+        self.python_path = python_path
+        self.container_name = f"sn1-{os.path.splitext(os.path.basename(self.local_script_path))[0]}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
-        with open(path, 'r') as f:
-            content = f.read()
-        scheme = "token" if github_token.startswith(("ghp_", "github_pat_")) else "Bearer"
-        headers = {
-            "Authorization": f"{scheme} {github_token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "sn1-cli"
-        }
-        gist_data = {"description": "Agent code", "public": True, "files": {os.path.basename(path): {"content": content}}}
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://api.github.com/gists", json=gist_data, headers=headers) as resp:
-                if resp.status != 201:
-                    try:
-                        error_json = await resp.json()
-                        error_msg = error_json.get("message") or str(error_json)
-                    except Exception:
-                        error_msg = await resp.text()
-                    raise RuntimeError(
-                        f"Failed to create gist ({resp.status}): {error_msg}. Ensure your GITHUB_TOKEN is valid and has 'gist' scope, visit: https://github.com/settings/tokens/new"
-                    )
-                gist_url = (await resp.json())["html_url"]
-                logger.info(f"Created gist: {gist_url}")
-        
-        await sub.set_reveal_commitment(wallet=wallet, netuid=NETUID, data=gist_url, blocks_until_reveal = 1)
-        logger.info(f"Committed gist URL to blockchain.")
-    
-    asyncio.run(main())
-    
-@cli.command("pull")
-@click.argument("uid", type=int, required=False)
-def pull( uid:int = None):
-    if uid is not None:
-        asyncio.run(pull_agent(uid))
-    else:
-        async def pull_all():
-            sub = await get_subtensor()
-            metagraph = await sub.metagraph(NETUID)
-            for uid in metagraph.uids:
-                await pull_agent(int(uid))
-        asyncio.run(pull_all())
+        self.token = issue_token(ttl_s=token_ttl, allowed_methods=allowed_methods or set())
+        self.base_url = (base_url or "http://host.docker.internal:5005").rstrip("/")
 
-# ---------------- Runner ----------------
-@cli.command("validator")
-def validator():
-    coldkey = get_conf("BT_WALLET_COLD", except_input=True)
-    hotkey = get_conf("BT_WALLET_HOT", except_input=True)
-    wallet = bt.wallet(name=coldkey, hotkey=hotkey)
-    logger.debug(f"Validator initialized with wallet: {coldkey}/{hotkey}")
+        # Ensure local server if pointing to host
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(self.base_url)
+            host = (parsed.hostname or "").lower()
+            port = parsed.port or 5005
+            if host in {"host.docker.internal", "localhost", "127.0.0.1"}:
+                ensure_server_running(host="0.0.0.0", port=port)
+        except Exception as _e:
+            logger.warning(f"ensure_server_running failed: {_e}")
 
-    async def _run():
-        # Example loop that creates a container and calls into it
-        from .docker import Container
-        logger.debug("Starting validator main loop")
-        while True:
-            global HEARTBEAT
+        logger.info(f"Preparing container {self.container_name} from {self.image}")
+        self.container_id = create_running_container(
+            self.image,
+            self.container_name,
+            env={"RUNNER_BASE_URL": self.base_url, "SN1_TOKEN": self.token},
+        )
+
+        # Copy user script and our package into the container
+        copy_into_container(self.container_id, self.local_script_path, self.in_container_script_path)
+        pkg_src = os.path.dirname(__file__)
+        copy_into_container(self.container_id, pkg_src, "/app")
+
+        # Copy embedded bootstrapper module file
+        boot_src = os.path.join(pkg_src, "boot.py")
+        copy_into_container(self.container_id, boot_src, "/app/boot.py")
+
+        self._destroyed = False
+
+    def _ensure_active(self) -> None:
+        if self._destroyed:
+            raise RuntimeError("Container has been destroyed")
+
+    def _call(self, entry: str, *args, **kwargs):
+        self._ensure_active()
+        payload = {"args": list(args), "kwargs": kwargs}
+        payload_json = json.dumps(payload, separators=(",", ":"))
+        cmd_parts = [
+            shlex.quote(self.python_path),
+            "/app/boot.py",
+            "--script", shlex.quote(self.in_container_script_path),
+            "--entry", shlex.quote(entry),
+            "--payload", shlex.quote(payload_json),
+        ]
+        cmd = " ".join(cmd_parts)
+        rc, out, err = exec_in_container(self.container_id, cmd)
+        if err:
+            for line in err.splitlines():
+                logger.warning(f"[script][stderr] {line}")
+        parsed = None
+        if out and out.strip():
             try:
-                
-                SAMPLES = 10                
-                HEARTBEAT = time.monotonic()
-                logger.debug(f"Heartbeat updated: {HEARTBEAT}")
-                sub = await get_subtensor()
-                logger.debug("Subtensor connection established")
-                
-                metagraph = await sub.metagraph(NETUID)
-                uids = [ int(uid) for uid in metagraph.uids]
-                weights = [ 0 for _ in metagraph.uids ]
-                logger.debug(f"Loaded metagraph with {len(uids)} UIDs: {uids}")
-                
-                for uid in uids:
-                    logger.debug(f"Processing UID {uid}")
-                    gen_tmp_file: str = await pull_agent( uid )
-                    logger.debug(f"Retrieved agent file for UID {uid}: {gen_tmp_file}")
-                    gen_tmp_file = "gen.py"
-                    logger.debug(f"Using hardcoded agent file: {gen_tmp_file}")
-                    with Container( gen_tmp_file ) as c:
-                        logger.debug(f"Created container for UID {uid}")
-                        success = 0
-                        for sample_idx in range(SAMPLES):
-                            try:
-                                x = random.random()
-                                y = random.random()
-                                z = x * y
-                                prompt = f"what is {x} * {y}?, return you answer like <Answer>12.232</Answer>"
-                                logger.debug(f"UID {uid} sample {sample_idx}: testing {x} * {y} = {z}")
-                                response = c.llm( prompt = prompt )
-                                logger.debug(f"UID {uid} sample {sample_idx}: got response: {response}")
-                                match = re.search(r'<Answer>(.*?)</Answer>', response)
-                                if match:
-                                    parsed_answer = float(match.group(1))
-                                    if abs(parsed_answer - z) <= 1e-6:
-                                        success += 1
-                                        logger.debug(f"UID {uid} sample {sample_idx}: correct answer {parsed_answer}")
-                                    else:
-                                        logger.debug(f"UID {uid} sample {sample_idx}: incorrect answer {parsed_answer}, expected {z}")
-                                else:
-                                    logger.debug(f"UID {uid} sample {sample_idx}: no answer found in response")
-                            except Exception as e: 
-                                logger.debug(f"UID {uid} sample {sample_idx}: error - {e}")
-                        weights[uid] = float(success)/SAMPLES
-                        logger.debug(f"UID {uid}: scored {success}/{SAMPLES} = {weights[uid]}")
-                                                
-                logger.debug(f"Setting weights: UIDs={uids}, weights={weights}")
-                await sub.set_weights( 
-                    wallet=wallet, 
-                    netuid=NETUID, 
-                    weights=weights, 
-                    uids=uids,
-                    wait_for_inclusion=False,
-                    wait_for_finalization=False
-                )
-                logger.debug("Weights successfully set")
-                
-            except asyncio.CancelledError:
-                logger.debug("Validator loop cancelled")
-                break
-            except Exception as e:
-                traceback.print_exc()
-                logger.info(f"runner error: {e}; retrying...")
-                await asyncio.sleep(5)
+                parsed = json.loads(out.strip())
+            except json.JSONDecodeError:
+                parsed = None
+        if isinstance(parsed, dict) and parsed.get("ok") is False:
+            message = parsed.get("error", "remote error")
+            err_type = parsed.get("type")
+            if err_type:
+                message = f"{err_type}: {message}"
+            raise RuntimeError(message)
+        if rc != 0:
+            tail = (err or "").strip().splitlines()[-5:]
+            snippet = ("\n".join(tail)).strip()
+            if snippet:
+                raise RuntimeError(f"script exited with code {rc}:\n{snippet}")
+            raise RuntimeError(f"script exited with code {rc}")
+        if isinstance(parsed, dict) and "result" in parsed:
+            return parsed["result"]
+        if parsed is not None:
+            return parsed
+        return out
 
-    async def main():
-        logger.debug("Starting validator with watchdog")
-        await asyncio.gather(_run(), watchdog(timeout=60 * 10))
+    def __getattr__(self, name: str):
+        def _caller(*args, **kwargs):
+            return self._call(name, *args, **kwargs)
+        return _caller
 
-    asyncio.run(main())
+    def entries(self) -> list[str]:
+        try:
+            res = self._call("__list__")
+            if isinstance(res, list):
+                return [str(x) for x in res]
+        except Exception:
+            pass
+        return []
 
+    def destroy(self) -> None:
+        if not self._destroyed:
+            stop_and_remove_container(self.container_id)
+            self._destroyed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        return False
+
+# ---------------- CLI ----------------
+@click.group()
+@click.option('-v', '--verbose', count=True, help='Increase verbosity (-v INFO, -vv DEBUG, -vvv TRACE)')
+def cli(verbose):
+    setup_logging(verbose)
+
+@cli.group()
+def env():
+    """Environment utilities"""
+    pass
+
+@env.command("run")
+@click.argument("env_name_or_path")
+@click.option("--agent", "agent_path", required=True, help="Path to agent script (e.g., gen.py)")
+@click.option("--entry", "entry", default=None, help="Entrypoint function name (defaults to env ENTRYPOINT)")
+@click.option("--prompt", default=None, help="Prompt to pass if the entry expects it")
+@click.option("--samples", type=int, default=1, help="Number of times to invoke the entrypoint")
+def env_run(env_name_or_path: str, agent_path: str, entry: str | None, prompt: str | None, samples: int):
+    spec = load_env(env_name_or_path)
+    entry_name = entry or getattr(spec, "entrypoint", "solve")
+    with Container(agent_path, spec=spec) as c:
+        fn = getattr(c, entry_name)
+        for _ in range(samples):
+            kwargs = {}
+            if prompt is not None:
+                kwargs["prompt"] = prompt
+            res = fn(**kwargs)
+            click.echo(res)
 

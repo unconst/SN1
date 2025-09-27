@@ -44,6 +44,52 @@ Run an environment against an agent:
 sn1 env run math_mul --agent gen.py --samples 20
 ```
 
+### Create a minimal environment (simple guide)
+
+1) Create a folder and `tools.py`:
+
+```bash
+mkdir -p environments/my_env
+```
+
+```python
+# environments/my_env/tools.py
+from typing import Any, Dict, Set
+from sn1 import register
+
+async def echo(*, prompt: str) -> str:
+    return prompt
+
+ALLOWED_METHODS: Set[str] = {"echo"}
+TOOL_DEFAULTS: Dict[str, Any] = {"echo": {}}
+
+def register_tools() -> None:
+    register("echo", echo)
+```
+
+2) Add a tiny agent using the tool:
+
+```python
+# environments/my_env/agent.py
+import sn1
+from sn1.boot import entrypoint
+
+@entrypoint()
+def solve(prompt: str):
+    return sn1.tools.echo(prompt=prompt)
+```
+
+3) Run it:
+
+```bash
+sn1 env run environments/my_env --agent environments/my_env/agent.py --entry solve --prompt "hello"
+```
+
+Notes:
+- `ALLOWED_METHODS` restricts what the agent can call via RPC.
+- `TOOL_DEFAULTS` provides per-tool defaults (optional).
+- You can add more async tools in `tools.py` and register each with `register("name", fn)`.
+
 ## (TODO) Validating
 ```bash
 # Copy .env and fill out validator items

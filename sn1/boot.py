@@ -1,11 +1,8 @@
-# sn1/boot.py
 import sys, os, json, argparse, importlib.util, types
 from typing import Any, Callable, Dict, Optional
 
 ENTRYPOINTS: Dict[str, Callable[..., Any]] = {}
-
-# Make this module importable as 'sn1.boot' so user scripts can do
-# 'from sn1.boot import entrypoint' inside the container.
+# Ensure user code can `from sn1.boot import entrypoint`
 sys.modules.setdefault("sn1.boot", sys.modules[__name__])
 
 def entrypoint(name: Optional[str] = None):
@@ -21,7 +18,7 @@ def _load_module_from_path(path: str) -> types.ModuleType:
         raise RuntimeError(f"Unable to load module from {path}")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["sn1_user_module"] = mod
-    spec.loader.exec_module(mod)  # executes user code (which may use @entrypoint)
+    spec.loader.exec_module(mod)
     return mod
 
 def _json_default(o: Any):
@@ -33,27 +30,21 @@ def main() -> int:
     parser.add_argument("--entry", required=True, help="Function name to call")
     parser.add_argument("--payload", default="{}", help='JSON {"args": [], "kwargs": {}}')
     ns = parser.parse_args()
-
     try:
         payload = json.loads(ns.payload or "{}")
         args = payload.get("args", [])
         kwargs = payload.get("kwargs", {})
         if not isinstance(args, list) or not isinstance(kwargs, dict):
             raise ValueError("payload must contain list 'args' and dict 'kwargs'")
-
         _load_module_from_path(ns.script)
-
         target = ENTRYPOINTS.get(ns.entry)
         if target is None:
-            # fallback: call raw attribute on module if not decorated
             mod = sys.modules["sn1_user_module"]
             target = getattr(mod, ns.entry, None)
         if target is None:
             raise ValueError(f"unknown entry '{ns.entry}'")
-
         result = target(*args, **kwargs)
         if hasattr(result, "__await__"):
-            # allow async defs too
             import asyncio
             result = asyncio.get_event_loop().run_until_complete(result)
         print(json.dumps({"ok": True, "result": result}, ensure_ascii=False, default=_json_default))
@@ -64,3 +55,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

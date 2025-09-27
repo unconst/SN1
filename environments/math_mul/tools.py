@@ -4,11 +4,12 @@ import random
 import asyncio
 import aiohttp
 import logging
-from typing import Any, Dict, Set
-from sn1.server import register
-from sn1 import get_conf
+from typing import Any
+from sn1 import declare_tool, get_conf
 
 TERMINAL = {400, 404, 410}
+
+@declare_tool
 async def chutes(*, prompt: str, model: str = "unsloth/gemma-3-12b-it", timeout: int = 150, retries: int = 0, backoff: float = 1) -> str | None:
     url = f"https://llm.chutes.ai/v1/chat/completions"
     hdr = {"Authorization": f"Bearer {get_conf('CHUTES_API_KEY')}", "Content-Type": "application/json"}
@@ -27,9 +28,4 @@ async def chutes(*, prompt: str, model: str = "unsloth/gemma-3-12b-it", timeout:
                 if attempt > retries:
                     return None
                 await asyncio.sleep(backoff * 2 ** (attempt - 1) * (1 + random.uniform(-0.1, 0.1)))
-
-ALLOWED_METHODS: Set[str] = {"chutes"}
-TOOL_DEFAULTS: Dict[str, Any] = {"chutes": {"model": "unsloth/gemma-3-12b-it", "timeout": 120}}
-def register_tools() -> None:
-    register("chutes", chutes)
 
