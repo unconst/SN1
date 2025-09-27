@@ -1,5 +1,6 @@
 import os
 import sn1
+sn1.set_log_level("DEBUG")
 
 def main():
     spec = sn1.load_env(os.path.dirname(__file__))

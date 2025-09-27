@@ -26,6 +26,7 @@ import sn1
 @sn1.tool
 async def multiply(ctx: sn1.Context, x: float, y: float) -> float:
     # ctx.token is the caller token; carry any per-call metadata here
+    assert ctx.foo == 'bar'
     return x * y
 ```
 
@@ -43,7 +44,7 @@ import os
 import sn1
 spec = sn1.load_env(os.path.dirname(__file__))
 agent = os.path.join(os.path.dirname(__file__), "agent.py")
-with sn1.Container(agent=agent, spec=spec) as c:
+with sn1.Container(agent=agent, spec=spec, ctx={'foo': 'bar'}) as c:
     print(c.multiply(x=2, y=5))
 ```
 

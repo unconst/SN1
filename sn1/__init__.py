@@ -9,8 +9,20 @@ from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.concurrency import run_in_threadpool
 import os, sys, time, uuid, asyncio, logging, shutil, subprocess, secrets, threading, importlib, importlib.util, inspect, types, io, contextlib
 
-# Library logging: expose a named logger without configuring handlers/levels.
-logger = logging.getLogger("sn1")
+# Centralized logging kept inline for minimal footprint
+def _lvl(x):
+    return x if isinstance(x, int) else getattr(logging, str(x).upper(), logging.INFO)
+
+def setup_logging(level: str | int | None = None) -> None:
+    lvl = _lvl(level or os.getenv("SN1_LOGLEVEL"))
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s"))
+    r = logging.getLogger("sn1"); r.handlers.clear(); r.addHandler(h); r.setLevel(lvl)
+
+def set_log_level(level: str | int) -> None:
+    logging.getLogger("sn1").setLevel(_lvl(level))
+
+setup_logging(); logger = logging.getLogger("sn1")
 
 # ---------------- Host RPC client ----------------
 def _base_url(base_url: Optional[str] = None) -> str:
@@ -213,6 +225,7 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
                 created_at=time.time(),
                 headers={k: v for k, v in req.headers.items()},
             )
+            logger.debug("rpc_start id=%s method=%s args=%s kwargs=%s", ctx.request_id, ctx.method, payload.args, list(payload.kwargs.keys()))
             # Merge client-sent context into ctx.meta (namespaced under __ctx in kwargs)
             extra_ctx = payload.kwargs.pop("__ctx", None)
             if isinstance(extra_ctx, dict):
@@ -232,9 +245,10 @@ async def rpc_call(payload: RpcIn, req: Request, tok: str = Depends(_validate_to
                         res = await run_in_threadpool(fn, ctx, *payload.args, **payload.kwargs)
                     else:
                         res = await run_in_threadpool(fn, *payload.args, **payload.kwargs)
+            logger.debug("rpc_done id=%s method=%s", ctx.request_id, ctx.method)
             return {"ok": True, "result": res, "stdout": out_buf.getvalue(), "stderr": err_buf.getvalue()}
         except Exception as e:
-            logger.error(f"rpc error in {payload.method}: {e}")
+            logger.error("rpc_error method=%s error=%s", payload.method, e)
             return {"ok": False, "error": str(e), "stdout": out_buf.getvalue(), "stderr": err_buf.getvalue()}
 
 _SERVER_BOOT_LOCK = threading.Lock()
